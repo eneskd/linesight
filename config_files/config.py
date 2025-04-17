@@ -28,8 +28,14 @@ from config_files.user_config import *
 W_downsized = 160
 H_downsized = 120
 
-run_name = "run_name_to_be_changed"
+run_name = "test_003"
 running_speed = 80
+
+agent_type = "iqn"  # "mlp" or "iqn"
+
+prio_alpha = np.float32(0)  # Rainbow-IQN paper: 0.2, Rainbow paper: 0.5, PER paper 0.6
+prio_epsilon = np.float32(2e-3)  # Defaults to 10^-6 in stable-baselines
+prio_beta = np.float32(1)
 
 tm_engine_step_per_action = 5
 ms_per_tm_engine_step = 10
@@ -83,20 +89,6 @@ engineered_close_to_vcp_reward_schedule = [
 n_steps = 3
 constant_reward_per_ms = -6 / 5000
 reward_per_m_advanced_along_centerline = 5 / 500
-
-float_input_dim = 27 + 3 * n_zone_centers_in_inputs + 4 * n_prev_actions_in_inputs + 4 * n_contact_material_physics_behavior_types + 1
-float_hidden_dim = 256
-conv_head_output_dim = 5632
-dense_hidden_dimension = 1024
-iqn_embedding_dimension = 64
-iqn_n = 8  # must be an even number because we sample tau symmetrically around 0.5
-iqn_k = 32  # must be an even number because we sample tau symmetrically around 0.5
-iqn_kappa = 5e-3
-use_ddqn = False
-
-prio_alpha = np.float32(0)  # Rainbow-IQN paper: 0.2, Rainbow paper: 0.5, PER paper 0.6
-prio_epsilon = np.float32(2e-3)  # Defaults to 10^-6 in stable-baselines
-prio_beta = np.float32(1)
 
 number_times_single_memory_is_used_before_discard = 32  # 32 // 4
 
@@ -261,8 +253,8 @@ map_cycle = []
 
 
 map_cycle += [
-    # repeat(("map5", '"My Challenges/Map5.Challenge.Gbx"', "map5_0.5m_cl.npy", True, True), 4),
-    # repeat(("map5", '"My Challenges/Map5.Challenge.Gbx"', "map5_0.5m_cl.npy", False, True), 1),
+    repeat(("map5", '"My Challenges/Map5.Challenge.Gbx"', "map5_0.5m_cl.npy", True, True), 4),
+    repeat(("map5", '"My Challenges/Map5.Challenge.Gbx"', "map5_0.5m_cl.npy", False, True), 1),
     # repeat(("map8", '"My Challenges/Map8.Challenge.Gbx"', "map8_0.5m_cl.npy", True, True), 4),
     # repeat(("map8", '"My Challenges/Map8.Challenge.Gbx"', "map8_0.5m_cl.npy", False, True), 1),
     # repeat(("yosh1", '"My Challenges\Yosh1.Challenge.Gbx"', "yosh1_0.5m_clprog.npy", True, True), 4),
@@ -283,8 +275,8 @@ map_cycle += [
     # repeat(("B03", '"Official Maps\Green\B03-Race.Challenge.Gbx"', "B03-Race_10m_cl.npy", False, True), 1),
     # repeat(("B05", '"Official Maps\Green\B05-Race.Challenge.Gbx"', "B05-Race_10m_cl.npy", True, True), 4),
     # repeat(("B05", '"Official Maps\Green\B05-Race.Challenge.Gbx"', "B05-Race_10m_cl.npy", False, True), 1),
-    repeat(("hock", "ESL-Hockolicious.Challenge.Gbx", "ESL-Hockolicious_0.5m_cl2.npy", True, True), 4),
-    repeat(("hock", "ESL-Hockolicious.Challenge.Gbx", "ESL-Hockolicious_0.5m_cl2.npy", False, True), 1),
+    # repeat(("hock", "ESL-Hockolicious.Challenge.Gbx", "ESL-Hockolicious_0.5m_cl2.npy", True, True), 4),
+    # repeat(("hock", "ESL-Hockolicious.Challenge.Gbx", "ESL-Hockolicious_0.5m_cl2.npy", False, True), 1),
     # repeat(("A02", f'"Official Maps\A02-Race.Challenge.Gbx"', "A02-Race_0.5m_cl2.npy", False, False), 1),
     # repeat(("yellowmile", f'"The Yellow Mile_.Challenge.Gbx"', "YellowMile_0.5m_cl.npy", False, False), 1),
     # repeat(("te86", f'"te 86.Challenge.Gbx"', "te86_0.5m_cl.npy", False, False), 1),

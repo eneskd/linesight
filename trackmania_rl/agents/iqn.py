@@ -16,6 +16,7 @@ import torch
 from torchrl.data import ReplayBuffer
 
 from config_files import config_copy
+from config_files import iqn_config_copy
 from trackmania_rl import utilities
 
 
@@ -170,9 +171,9 @@ def iqn_loss(targets: torch.Tensor, outputs: torch.Tensor, tau_outputs: torch.Te
     TD_error = targets[:, :, None, :] - outputs[:, None, :, :]
     # (batch_size, iqn_n, iqn_n, 1)
     loss = torch.where(
-        torch.lt(torch.abs(TD_error), config_copy.iqn_kappa),
-        (0.5 / config_copy.iqn_kappa) * TD_error**2,
-        (torch.abs(TD_error) - 0.5 * config_copy.iqn_kappa),
+        torch.lt(torch.abs(TD_error), iqn_config_copy.iqn_kappa),
+        (0.5 / iqn_config_copy.iqn_kappa) * TD_error**2,
+        (torch.abs(TD_error) - 0.5 * iqn_config_copy.iqn_kappa),
     )
     tau = tau_outputs.reshape([num_quantiles, batch_size, 1]).transpose(0, 1)  # (batch_size, iqn_n, 1)
     tau = tau[:, None, :, :].expand([-1, num_quantiles, -1, -1])  # (batch_size, iqn_n, iqn_n, 1)
@@ -261,7 +262,7 @@ class Trainer:
                 #   Use online network to choose an action for next state.
                 #   This action is chosen AFTER reduction to the mean, and repeated to all quantiles
                 #
-                if config_copy.use_ddqn:
+                if iqn_config_copy.use_ddqn:
                     a__tpo__online__reduced_repeated = (
                         self.online_network(
                             next_state_img_tensor,
@@ -299,11 +300,11 @@ class Trainer:
                 q__st__online__quantiles_tau3.gather(1, actions).reshape([self.iqn_n, self.batch_size, 1]).transpose(0, 1)
             )  # (batch_size, iqn_n, 1)
 
-            loss = iqn_loss(outputs_target_tau2, outputs_tau3, tau3, config_copy.iqn_n, config_copy.batch_size)
+            loss = iqn_loss(outputs_target_tau2, outputs_tau3, tau3, iqn_config_copy.iqn_n, config_copy.batch_size)
 
             target_self_loss = torch.sqrt(
                 iqn_loss(
-                    outputs_target_tau2.detach(), outputs_target_tau2.detach(), tau2.detach(), config_copy.iqn_n, config_copy.batch_size
+                    outputs_target_tau2.detach(), outputs_target_tau2.detach(), tau2.detach(), iqn_config_copy.iqn_n, config_copy.batch_size
                 )
             )
 
@@ -449,11 +450,11 @@ def make_untrained_iqn_network(jit: bool, is_inference: bool) -> Tuple[IQN_Netwo
     """
 
     uncompiled_model = IQN_Network(
-        float_inputs_dim=config_copy.float_input_dim,
-        float_hidden_dim=config_copy.float_hidden_dim,
-        conv_head_output_dim=config_copy.conv_head_output_dim,
-        dense_hidden_dimension=config_copy.dense_hidden_dimension,
-        iqn_embedding_dimension=config_copy.iqn_embedding_dimension,
+        float_inputs_dim=iqn_config_copy.float_input_dim,
+        float_hidden_dim=iqn_config_copy.float_hidden_dim,
+        conv_head_output_dim=iqn_config_copy.conv_head_output_dim,
+        dense_hidden_dimension=iqn_config_copy.dense_hidden_dimension,
+        iqn_embedding_dimension=iqn_config_copy.iqn_embedding_dimension,
         n_actions=len(config_copy.inputs),
         float_inputs_mean=config_copy.float_inputs_mean,
         float_inputs_std=config_copy.float_inputs_std,

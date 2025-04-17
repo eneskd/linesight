@@ -27,6 +27,14 @@ def copy_configuration_file():
         base_dir / "config_files" / "config.py",
         base_dir / "config_files" / "config_copy.py",
     )
+    shutil.copyfile(
+        base_dir / "config_files" / "mlp_config.py",
+        base_dir / "config_files" / "mlp_config_copy.py",
+    )
+    shutil.copyfile(
+        base_dir / "config_files" / "iqn_config.py",
+        base_dir / "config_files" / "iqn_config_copy.py",
+    )
 
 
 if __name__ == "__main__":
@@ -50,9 +58,21 @@ from art import tprint
 from torch.multiprocessing import Lock
 
 from config_files import config_copy
-from trackmania_rl.agents.iqn import make_untrained_iqn_network
-from trackmania_rl.multiprocess.collector_process import collector_process_fn
-from trackmania_rl.multiprocess.learner_process import learner_process_fn
+from config_files import mlp_config_copy
+from config_files import iqn_config_copy
+
+
+# === AGENT SELECTION ===
+if getattr(config_copy, "agent_type", "iqn").lower() == "mlp":
+    from trackmania_rl.agents.mlp import make_untrained_mlp_agent as make_untrained_agent
+    from trackmania_rl.multiprocess.learner_process_mlp import learner_process_fn
+    from trackmania_rl.multiprocess.collector_process_mlp import collector_process_fn
+
+else:
+    from trackmania_rl.agents.iqn import make_untrained_iqn_network as make_untrained_agent
+    from trackmania_rl.multiprocess.learner_process import learner_process_fn
+    from trackmania_rl.multiprocess.collector_process import collector_process_fn
+
 
 # noinspection PyUnresolvedReferences
 torch.backends.cudnn.benchmark = True
@@ -89,7 +109,7 @@ if __name__ == "__main__":
     clear_tm_instances()
 
     base_dir = Path(__file__).resolve().parents[1]
-    save_dir = base_dir / "save" / config_copy.run_name
+    save_dir = base_dir / "save" / f"{config_copy.run_name}_{config_copy.agent_type}"
     save_dir.mkdir(parents=True, exist_ok=True)
     tensorboard_base_dir = base_dir / "tensorboard"
 
@@ -100,7 +120,7 @@ if __name__ == "__main__":
     )
 
     print("Run:\n\n")
-    tprint(config_copy.run_name, font="tarty4")
+    tprint(f"{config_copy.run_name}_{config_copy.agent_type}", font="tarty4")
     print("\n" * 2)
     tprint("Linesight", font="tarty1")
     print("\n" * 2)
@@ -115,7 +135,7 @@ if __name__ == "__main__":
     rollout_queues = [mp.Queue(config_copy.max_rollout_queue_size) for _ in range(config_copy.gpu_collectors_count)]
     shared_network_lock = Lock()
     game_spawning_lock = Lock()
-    _, uncompiled_shared_network = make_untrained_iqn_network(jit=config_copy.use_jit, is_inference=False)
+    _, uncompiled_shared_network = make_untrained_agent(jit=config_copy.use_jit, is_inference=False)
     uncompiled_shared_network.share_memory()
 
     # Start worker process

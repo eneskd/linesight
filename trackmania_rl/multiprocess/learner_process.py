@@ -22,6 +22,8 @@ from torch.utils.tensorboard import SummaryWriter
 from torchrl.data.replay_buffers import PrioritizedSampler
 
 from config_files import config_copy
+from config_files import iqn_config_copy
+
 from trackmania_rl import buffer_management, utilities
 from trackmania_rl.agents import iqn as iqn
 from trackmania_rl.agents.iqn import make_untrained_iqn_network
@@ -187,7 +189,7 @@ def learner_process_fn(
         config_copy.tensorboard_suffix_schedule,
         accumulated_stats["cumul_number_frames_played"],
     )
-    tensorboard_writer = SummaryWriter(log_dir=str(tensorboard_base_dir / (config_copy.run_name + tensorboard_suffix)))
+    tensorboard_writer = SummaryWriter(log_dir=str(tensorboard_base_dir / (config_copy.run_name  + '_' + config_copy.agent_type + tensorboard_suffix)))
 
     loss_history = []
     loss_test_history = []
@@ -204,12 +206,12 @@ def learner_process_fn(
         optimizer=optimizer1,
         scaler=scaler,
         batch_size=config_copy.batch_size,
-        iqn_n=config_copy.iqn_n,
+        iqn_n=iqn_config_copy.iqn_n,
     )
 
     inferer = iqn.Inferer(
         inference_network=online_network,
-        iqn_k=config_copy.iqn_k,
+        iqn_k=iqn_config_copy.iqn_k,
         tau_epsilon_boltzmann=config_copy.tau_epsilon_boltzmann,
     )
 
@@ -243,7 +245,7 @@ def learner_process_fn(
         )
         if new_tensorboard_suffix != tensorboard_suffix:
             tensorboard_suffix = new_tensorboard_suffix
-            tensorboard_writer = SummaryWriter(log_dir=str(tensorboard_base_dir / (config_copy.run_name + tensorboard_suffix)))
+            tensorboard_writer = SummaryWriter(log_dir=str(tensorboard_base_dir / (config_copy.run_name  + '_' + config_copy.agent_type + tensorboard_suffix)))
 
         (
             new_memory_size,
@@ -635,7 +637,7 @@ def learner_process_fn(
 
             if online_network.training:
                 online_network.eval()
-            tau = torch.linspace(0.05, 0.95, config_copy.iqn_k)[:, None].to("cuda")
+            tau = torch.linspace(0.05, 0.95, iqn_config_copy.iqn_k)[:, None].to("cuda")
             per_quantile_output = inferer.infer_network(rollout_results["frames"][0], rollout_results["state_float"][0], tau)
             for i, std in enumerate(list(per_quantile_output.std(axis=0))):
                 step_stats[f"std_within_iqn_quantiles_for_action{i}"] = std

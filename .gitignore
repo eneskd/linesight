@@ -32,3 +32,7 @@ Nadeo.ini
 *.lnk
 .stignore*
 config_files/config_copy.py
+
+.qodo
+config_files/iqn_config_copy.py
+config_files/mlp_config_copy.py
