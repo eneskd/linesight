@@ -28,10 +28,12 @@ from config_files.user_config import *
 W_downsized = 160
 H_downsized = 120
 
-run_name = "test_003"
+run_name = "mlp_test_001"
 running_speed = 80
 
-agent_type = "iqn"  # "mlp" or "iqn"
+agent_type = "mlp"  # "mlp", "iqn", "lstm"
+
+
 
 prio_alpha = np.float32(0)  # Rainbow-IQN paper: 0.2, Rainbow paper: 0.5, PER paper 0.6
 prio_epsilon = np.float32(2e-3)  # Defaults to 10^-6 in stable-baselines
@@ -56,6 +58,10 @@ oversample_maximum_term_steps = 5
 min_horizon_to_update_priority_actions = temporal_mini_race_duration_actions - 40
 # If mini_race_time == mini_race_duration this is the end of the minirace
 margin_to_announce_finish_meters = 700
+
+# input dimentions
+float_input_dim = 27 + 3 * n_zone_centers_in_inputs + 4 * n_prev_actions_in_inputs + 4 * n_contact_material_physics_behavior_types + 1
+
 
 global_schedule_speed = 1
 

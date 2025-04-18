@@ -95,13 +95,13 @@ def make_untrained_mlp_agent(jit: bool, is_inference: bool) -> Tuple[MLPAgent, M
     """
     Factory function to create two identical MLP agents (compiled and uncompiled).
     """
-    hidden_dims = mlp_config_copy.mlp_hidden_dims
+    hidden_dims = mlp_config_copy.get_lstm_mlp_hidden_dims()
     # Use single-channel image shape: (1, H, W)
     img_shape = (1, config_copy.H_downsized, config_copy.W_downsized)
     activation = getattr(mlp_config_copy, "mlp_activation", "relu")
     dropout = getattr(mlp_config_copy, "mlp_dropout", 0.0)
     uncompiled_model = MLPAgent(
-        float_inputs_dim=mlp_config_copy.float_input_dim,
+        float_inputs_dim=config_copy.float_input_dim,
         img_shape=img_shape,
         hidden_dims=hidden_dims,
         n_actions=len(config_copy.inputs),

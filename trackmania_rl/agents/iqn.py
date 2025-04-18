@@ -450,7 +450,7 @@ def make_untrained_iqn_network(jit: bool, is_inference: bool) -> Tuple[IQN_Netwo
     """
 
     uncompiled_model = IQN_Network(
-        float_inputs_dim=iqn_config_copy.float_input_dim,
+        float_inputs_dim=config_copy.float_input_dim,
         float_hidden_dim=iqn_config_copy.float_hidden_dim,
         conv_head_output_dim=iqn_config_copy.conv_head_output_dim,
         dense_hidden_dimension=iqn_config_copy.dense_hidden_dimension,

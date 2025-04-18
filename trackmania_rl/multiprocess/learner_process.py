@@ -17,6 +17,7 @@ from pathlib import Path
 import joblib
 import numpy as np
 import torch
+from numba.core.cgutils import printf
 from torch import multiprocessing as mp
 from torch.utils.tensorboard import SummaryWriter
 from torchrl.data.replay_buffers import PrioritizedSampler
@@ -423,6 +424,7 @@ def learner_process_fn(
                 inputs_only=True,
             )
 
+        printf(fill_buffer)
         # ===============================================
         #   FILL BUFFER WITH (S, A, R, S') transitions
         # ===============================================
@@ -493,6 +495,22 @@ def learner_process_fn(
 
             if not online_network.training:
                 online_network.train()
+
+            print("check")
+            if len(buffer) < memory_size_start_learn:
+                print(
+                    f"[Not training] Buffer too small: len(buffer)={len(buffer)} < memory_size_start_learn={memory_size_start_learn}"
+                )
+            elif (
+                    accumulated_stats["cumul_number_single_memories_used"] + offset_cumul_number_single_memories_used
+                    > accumulated_stats["cumul_number_single_memories_should_have_been_used"]
+            ):
+                print(
+                    "[Not training] Used memories condition not met: "
+                    f"cumul_number_single_memories_used ({accumulated_stats['cumul_number_single_memories_used']}) + "
+                    f"offset_cumul_number_single_memories_used ({offset_cumul_number_single_memories_used}) > "
+                    f"cumul_number_single_memories_should_have_been_used ({accumulated_stats['cumul_number_single_memories_should_have_been_used']})"
+                )
 
             while (
                 len(buffer) >= memory_size_start_learn

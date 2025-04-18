@@ -64,39 +64,95 @@ def learner_process_fn(
     online_network, uncompiled_online_network = make_untrained_mlp_agent(config_copy.use_jit, is_inference=False)
     target_network, _ = make_untrained_mlp_agent(config_copy.use_jit, is_inference=False)
 
+    print("Learner process started (MLP agent).")
     print(online_network)
     utilities.count_parameters(online_network)
 
+    # Initialize stats tracking
     accumulated_stats: defaultdict[str, typing.Any] = defaultdict(int)
     accumulated_stats["alltime_min_ms"] = {}
     accumulated_stats["rolling_mean_ms"] = {}
     previous_alltime_min = None
     time_last_save = time.perf_counter()
+    save_frequency_s = config_copy.save_frequency_s if hasattr(config_copy, 'save_frequency_s') else 5 * 60
     queue_check_order = list(range(len(rollout_queues)))
     rollout_queue_readers = [q._reader for q in rollout_queues]
     time_waited_for_workers_since_last_tensorboard_write = 0
     time_training_since_last_tensorboard_write = 0
     time_testing_since_last_tensorboard_write = 0
+    
+    # Create save directory if it doesn't exist
+    save_dir.mkdir(parents=True, exist_ok=True)
 
     # ========================================================
     # Load existing stuff
     # ========================================================
-    try:
-        online_network.load_state_dict(torch.load(f=save_dir / "weights1.torch", weights_only=False))
-        target_network.load_state_dict(torch.load(f=save_dir / "weights2.torch", weights_only=False))
-        print(" =====================     Learner weights loaded !     ============================")
-    except:
-        print(" Learner could not load weights")
+    # First try to load from consolidated checkpoint file
+    checkpoint_loaded = False
+    checkpoint_files = list(save_dir.glob("checkpoint_step_*.pt"))
+
+
+    # First try to load from consolidated checkpoint file
+    checkpoint_loaded = False
+    if checkpoint_files:
+        latest_checkpoint = max(checkpoint_files, key=lambda p: int(p.stem.split('_')[-1]))
+        try:
+            checkpoint = torch.load(latest_checkpoint)
+            online_network.load_state_dict(checkpoint['online_network'])
+            target_network.load_state_dict(checkpoint['target_network'])
+            accumulated_stats = checkpoint['stats']
+            shared_steps.value = accumulated_stats["cumul_number_frames_played"]
+            print(f" ===================== Loaded checkpoint from {latest_checkpoint} ============================")
+            print(f" ===================== Resumed from step {accumulated_stats['cumul_number_frames_played']} ============================")
+            checkpoint_loaded = True
+        except Exception as e:
+            print(f" Error loading checkpoint from {latest_checkpoint}: {e}")
+    
+    # Fall back to individual files if checkpoint loading failed
+    if not checkpoint_loaded:
+        try:
+            online_network.load_state_dict(torch.load(f=save_dir / "weights1.torch", weights_only=False))
+            target_network.load_state_dict(torch.load(f=save_dir / "weights2.torch", weights_only=False))
+            print(" =====================     Learner weights loaded !     ============================")
+        except Exception as e:
+            print(f" Learner could not load weights: {e}")
+
+        try:
+            accumulated_stats = joblib.load(save_dir / "accumulated_stats.joblib")
+            shared_steps.value = accumulated_stats["cumul_number_frames_played"]
+            print(" =====================      Learner stats loaded !      ============================")
+        except Exception as e:
+            print(f" Learner could not load stats: {e}")
+
+    # Initialize optimizer AFTER model weights are loaded
+    optimizer1 = torch.optim.RAdam(
+        online_network.parameters(),
+        lr=utilities.from_exponential_schedule(config_copy.lr_schedule, accumulated_stats["cumul_number_frames_played"]),
+        eps=config_copy.adam_epsilon,
+        betas=(config_copy.adam_beta1, config_copy.adam_beta2),
+    )
+
+    scaler = torch.amp.GradScaler("cuda")
+
+
+    # Load optimizer and scaler state if available
+    if checkpoint_loaded:
+        try:
+            optimizer1.load_state_dict(checkpoint['optimizer'])
+            scaler.load_state_dict(checkpoint['scaler'])
+            print(" =========================     Optimizer and scaler loaded from checkpoint!     ================================")
+        except Exception as e:
+            print(f" Could not load optimizer/scaler from checkpoint: {e}")
+    else:
+        try:
+            optimizer1.load_state_dict(torch.load(f=save_dir / "optimizer1.torch", weights_only=False))
+            scaler.load_state_dict(torch.load(f=save_dir / "scaler.torch", weights_only=False))
+            print(" =========================     Optimizer loaded !     ================================")
+        except Exception as e:
+            print(f" Could not load optimizer: {e}")
 
     with shared_network_lock:
         uncompiled_shared_network.load_state_dict(uncompiled_online_network.state_dict())
-
-    try:
-        accumulated_stats = joblib.load(save_dir / "accumulated_stats.joblib")
-        shared_steps.value = accumulated_stats["cumul_number_frames_played"]
-        print(" =====================      Learner stats loaded !      ============================")
-    except:
-        print(" Learner could not load stats")
 
     if "rolling_mean_ms" not in accumulated_stats.keys():
         accumulated_stats["rolling_mean_ms"] = {}
@@ -106,26 +162,15 @@ def learner_process_fn(
     neural_net_reset_counter = 0
     single_reset_flag = config_copy.single_reset_flag
 
-    optimizer1 = torch.optim.RAdam(
-        online_network.parameters(),
-        lr=utilities.from_exponential_schedule(config_copy.lr_schedule, accumulated_stats["cumul_number_frames_played"]),
-        eps=config_copy.adam_epsilon,
-        betas=(config_copy.adam_beta1, config_copy.adam_beta2),
-    )
 
-    scaler = torch.amp.GradScaler("cuda")
+
     memory_size, memory_size_start_learn = utilities.from_staircase_schedule(
         config_copy.memory_size_schedule, accumulated_stats["cumul_number_frames_played"]
     )
     buffer, buffer_test = make_buffers(memory_size)
     offset_cumul_number_single_memories_used = memory_size_start_learn * config_copy.number_times_single_memory_is_used_before_discard
 
-    try:
-        optimizer1.load_state_dict(torch.load(f=save_dir / "optimizer1.torch", weights_only=False))
-        scaler.load_state_dict(torch.load(f=save_dir / "scaler.torch", weights_only=False))
-        print(" =========================     Optimizer loaded !     ================================")
-    except:
-        print(" Could not load optimizer")
+    # Optimizer loading moved to the consolidated checkpoint loading section above
 
     tensorboard_suffix = utilities.from_staircase_schedule(
         config_copy.tensorboard_suffix_schedule,
@@ -139,9 +184,14 @@ def learner_process_fn(
     grad_norm_history = []
     layer_grad_norm_history = defaultdict(list)
 
+    print(f"Replay buffer memory size: {memory_size}, memory_size_start_learn: {memory_size_start_learn}")
+    print(f"Batch size: {config_copy.batch_size}")
+    print(f"Initial shared step value: {shared_steps.value}")
+
     # ========================================================
     # Training loop
     # ========================================================
+    step = 0
     while True:
         before_wait_time = time.perf_counter()
         wait(rollout_queue_readers)
@@ -162,8 +212,13 @@ def learner_process_fn(
                     loop_number,
                 ) = rollout_queues[idx].get()
                 queue_check_order.append(queue_check_order.pop(queue_check_order.index(idx)))
+                print(f"\n[Step {step}] Received rollout from queue {idx}:")
+                print(f"  Map: {map_name}, Explo: {is_explo}, Loop: {loop_number}, Rollout duration: {rollout_duration:.2f}s")
+                print(f"  Rollout stats: status={map_status}, end_race_stats_keys={list(end_race_stats.keys()) if end_race_stats['race_finished'] else None}")
+                print(f"  fill_buffer stats: status={fill_buffer}")
                 break
 
+        print("after fill")
         importlib.reload(config_copy)
 
         new_tensorboard_suffix = utilities.from_staircase_schedule(
@@ -208,13 +263,22 @@ def learner_process_fn(
         # ===============================================
         #   FILL BUFFER WITH (S, A, R, S') transitions
         # ===============================================
+        print(fill_buffer)
+
         if fill_buffer:
             current_step = accumulated_stats["cumul_number_frames_played"]
 
-            engineered_speedslide_reward = utilities.from_staircase_schedule(config_copy.engineered_speedslide_reward_schedule, current_step)
-            engineered_neoslide_reward = utilities.from_staircase_schedule(config_copy.engineered_neoslide_reward_schedule, current_step)
-            engineered_kamikaze_reward = utilities.from_staircase_schedule(config_copy.engineered_kamikaze_reward_schedule, current_step)
-            engineered_close_to_vcp_reward = utilities.from_staircase_schedule(config_copy.engineered_close_to_vcp_reward_schedule, current_step)
+            # Get reward coefficients from config
+            constant_reward_per_ms = config_copy.constant_reward_per_ms
+            reward_per_m_advanced_along_centerline = config_copy.reward_per_m_advanced_along_centerline
+            engineered_speedslide_reward = utilities.from_staircase_schedule(
+                config_copy.engineered_speedslide_reward_schedule, current_step)
+            engineered_neoslide_reward = utilities.from_staircase_schedule(
+                config_copy.engineered_neoslide_reward_schedule, current_step)
+            engineered_kamikaze_reward = utilities.from_staircase_schedule(
+                config_copy.engineered_kamikaze_reward_schedule, current_step)
+            engineered_close_to_vcp_reward = utilities.from_staircase_schedule(
+                config_copy.engineered_close_to_vcp_reward_schedule, current_step)
 
             (
                 buffer,
@@ -234,12 +298,37 @@ def learner_process_fn(
                 engineered_close_to_vcp_reward,
             )
 
+            accumulated_stats[
+                "cumul_number_memories_generated"] += number_memories_added_train + number_memories_added_test
+            shared_steps.value = accumulated_stats["cumul_number_frames_played"]
+            neural_net_reset_counter += number_memories_added_train
+            accumulated_stats["cumul_number_single_memories_should_have_been_used"] += (
+                    config_copy.number_times_single_memory_is_used_before_discard * number_memories_added_train
+            )
+            print(f" NMG={accumulated_stats['cumul_number_memories_generated']:<8}")
+
         # ===============================================
         #   LEARN ON BATCH
         # ===============================================
 
         if not online_network.training:
             online_network.train()
+
+        if len(buffer) < memory_size_start_learn:
+            print(
+                f"[Not training] Buffer too small: len(buffer)={len(buffer)} < memory_size_start_learn={memory_size_start_learn}"
+            )
+        elif (
+                accumulated_stats["cumul_number_single_memories_used"] + offset_cumul_number_single_memories_used
+                > accumulated_stats["cumul_number_single_memories_should_have_been_used"]
+        ):
+            print(
+                "[Not training] Used memories condition not met: "
+                f"cumul_number_single_memories_used ({accumulated_stats['cumul_number_single_memories_used']}) + "
+                f"offset_cumul_number_single_memories_used ({offset_cumul_number_single_memories_used}) > "
+                f"cumul_number_single_memories_should_have_been_used ({accumulated_stats['cumul_number_single_memories_should_have_been_used']})"
+            )
+
 
         while (
             len(buffer) >= memory_size_start_learn
@@ -258,6 +347,12 @@ def learner_process_fn(
                 next_state_float_tensor,  # (batch_size, float_input_dim)
                 gammas_terminal,
             ) = batch
+
+            accumulated_stats["cumul_number_single_memories_used"] += (
+                4 * config_copy.batch_size
+                if (len(buffer) < buffer._storage.max_size and buffer._storage.max_size > 200_000)
+                else config_copy.batch_size
+            )  # do fewer batches while memory is not full
 
             # Ensure image tensors are (batch, 1, H, W)
             if state_img_tensor.ndim == 3:
@@ -283,14 +378,49 @@ def learner_process_fn(
             scaler.step(optimizer1)
             scaler.update()
 
-            train_on_batch_duration_history.append(time.perf_counter() - train_start_time)
+            loss_float = loss.detach().cpu().item()
+            mean_q = q_values.mean().detach().cpu().item()
+            max_q = q_values.max().detach().cpu().item()
+            min_q = q_values.min().detach().cpu().item()
+
+            print(f"  Training step {step}")
+            print(f"    Loss: {loss_float:.6f}")
+            print(f"    Q value mean/max/min: {mean_q:.3f} / {max_q:.3f} / {min_q:.3f}")
+            print(f"    Grad norm: {grad_norm:.3f}")
+            print(f"    Buffer size: {len(buffer)}")
+            if step % 50 == 0:
+                # Show stats for first param tensor
+                first_layer = next(online_network.parameters())
+                print(f"    First param tensor (mean/std/min/max): {first_layer.mean().item():.3f} / {first_layer.std().item():.3f} / {first_layer.min().item():.3f} / {first_layer.max().item():.3f}")
+
+            # Update accumulated stats
+            train_duration_ms = (time.perf_counter() - train_start_time) * 1000
+            train_on_batch_duration_history.append(train_duration_ms / 1000)  # Convert back to seconds for history
+            
+            # Update cumulative counters
             accumulated_stats["cumul_number_single_memories_used"] += config_copy.batch_size
+            accumulated_stats["cumul_number_batches_done"] += 1
+            
+            # Update rolling mean statistics
+            if "rolling_mean_ms" not in accumulated_stats:
+                accumulated_stats["rolling_mean_ms"] = {}
+            
+            # Update rolling mean for training step time
+            key = "train_step"
+            prev_mean = accumulated_stats["rolling_mean_ms"].get(key, 0)
+            alpha = 0.01  # smoothing factor
+            accumulated_stats["rolling_mean_ms"][key] = (1 - alpha) * prev_mean + alpha * train_duration_ms
+            
+            # Update all-time minimum if applicable
+            if "alltime_min_ms" not in accumulated_stats:
+                accumulated_stats["alltime_min_ms"] = {}
+            if key not in accumulated_stats["alltime_min_ms"] or train_duration_ms < accumulated_stats["alltime_min_ms"][key]:
+                accumulated_stats["alltime_min_ms"][key] = train_duration_ms
+            
+            # Add to history for later analysis
             loss_history.append(loss.detach().cpu())
             if not math.isinf(grad_norm):
                 grad_norm_history.append(grad_norm)
-
-            accumulated_stats["cumul_number_batches_done"] += 1
-            print(f"B    {loss=:<8.2e} {grad_norm=:<8.2e} {train_on_batch_duration_history[-1]*1000:<8.1f}")
 
             utilities.custom_weight_decay(online_network, 1 - weight_decay)
             if accumulated_stats["cumul_number_batches_done"] % config_copy.send_shared_network_every_n_batches == 0:
@@ -310,11 +440,52 @@ def learner_process_fn(
                 )
                 utilities.soft_copy_param(target_network, online_network, config_copy.soft_update_tau)
             sys.stdout.flush()
+            step += 1
+
+            # --- BEGIN: Agent/optimizer/tensor summaries ---
+            # Aggregated param and grad stats to TensorBoard
+            total_params = 0
+            for name, param in online_network.named_parameters():
+                num_param = param.numel()
+                total_params += num_param
+                tensorboard_writer.add_scalar(f"agent_params/{name.replace('.', '_')}_mean", param.data.mean().item(), step)
+                tensorboard_writer.add_scalar(f"agent_params/{name.replace('.', '_')}_std", param.data.std().item(), step)
+                tensorboard_writer.add_scalar(f"agent_params/{name.replace('.', '_')}_min", param.data.min().item(), step)
+                tensorboard_writer.add_scalar(f"agent_params/{name.replace('.', '_')}_max", param.data.max().item(), step)
+                if param.grad is not None:
+                    tensorboard_writer.add_scalar(f"agent_grads/{name.replace('.', '_')}_grad_mean", param.grad.mean().item(), step)
+                    tensorboard_writer.add_scalar(f"agent_grads/{name.replace('.', '_')}_grad_std", param.grad.std().item(), step)
+            tensorboard_writer.add_scalar("agent_params/total_param_count", total_params, step)
+            # Optimizer state log (LR etc.)
+            for i, group in enumerate(optimizer1.param_groups):
+                tensorboard_writer.add_scalar(f"optimizer/group_{i}_lr", group['lr'], step)
+            # --- END: Agent/optimizer/tensor summaries ---
+
+            # TensorBoard: loss and q summary
+            tensorboard_writer.add_scalar('train/loss', loss_float, step)
+            tensorboard_writer.add_scalar('train/q_values_mean', mean_q, step)
+            tensorboard_writer.add_scalar('train/q_values_max', max_q, step)
+            tensorboard_writer.add_scalar('train/q_values_min', min_q, step)
+            tensorboard_writer.add_scalar('train/buffer_size', len(buffer), step)
+            tensorboard_writer.add_scalar('train/grad_norm', grad_norm, step)
+            tensorboard_writer.add_scalar('train/max_next_q', max_next_q.mean().item(), step)
+            tensorboard_writer.add_scalar('train/train_step_ms', train_duration_ms, step)
+            
+            # Log rolling means
+            for key, value in accumulated_stats["rolling_mean_ms"].items():
+                tensorboard_writer.add_scalar(f'rolling_mean_ms/{key}', value, step)
+            
+            # Log end race stats if available
+            if end_race_stats:
+                for k, v in end_race_stats.items():
+                    if isinstance(v, (int, float)):
+                        tensorboard_writer.add_scalar(f'race/{k}', v, step)
+                        print(f"    End race stat: {k} = {v}")
 
         # ===============================================
         #   WRITE AGGREGATED STATISTICS TO TENSORBOARD EVERY 5 MINUTES
         # ===============================================
-        save_frequency_s = 5 * 60
+        # Save frequency already defined at initialization
         if time.perf_counter() - time_last_save >= save_frequency_s:
             accumulated_stats["cumul_training_hours"] += (time.perf_counter() - time_last_save) / 3600
             time_since_last_save = time.perf_counter() - time_last_save
@@ -463,5 +634,21 @@ def learner_process_fn(
             # ===============================================
             #   SAVE
             # ===============================================
-            utilities.save_checkpoint(save_dir, online_network, target_network, optimizer1, scaler)
-            joblib.dump(accumulated_stats, save_dir / "accumulated_stats.joblib")
+            # Save checkpoint with step number in filename
+            checkpoint_path = save_dir / f"checkpoint_step_{accumulated_stats['cumul_number_frames_played']}.pt"
+            try:
+                torch.save({
+                    'online_network': online_network.state_dict(),
+                    'target_network': target_network.state_dict(),
+                    'optimizer': optimizer1.state_dict(),
+                    'scaler': scaler.state_dict(),
+                    'step': accumulated_stats['cumul_number_frames_played'],
+                    'stats': accumulated_stats
+                }, checkpoint_path)
+                
+                # Also save standard checkpoint files for backward compatibility
+                utilities.save_checkpoint(save_dir, online_network, target_network, optimizer1, scaler)
+                joblib.dump(accumulated_stats, save_dir / "accumulated_stats.joblib")
+                print(f"Checkpoint saved at step {accumulated_stats['cumul_number_frames_played']}")
+            except Exception as e:
+                print(f"Error saving checkpoint: {e}")

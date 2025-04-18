@@ -114,7 +114,7 @@ def collector_process_fn(
     for _ in range(5):
         dummy_img = np.random.rand(config_copy.H_downsized, config_copy.W_downsized).astype(np.float32)
         # dummy_img = inferer.preprocess_img(dummy_img)
-        dummy_float = np.random.rand(mlp_config_copy.float_input_dim).astype(np.float32)
+        dummy_float = np.random.rand(config_copy.float_input_dim).astype(np.float32)
         inferer.get_exploration_action(dummy_img, dummy_float)
 
     time_since_last_queue_push = time.perf_counter()

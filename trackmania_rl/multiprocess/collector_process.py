@@ -70,7 +70,7 @@ def collector_process_fn(
     for _ in range(5):
         inferer.infer_network(
             np.random.randint(low=0, high=255, size=(1, config_copy.H_downsized, config_copy.W_downsized), dtype=np.uint8),
-            np.random.rand(iqn_config_copy.float_input_dim).astype(np.float32),
+            np.random.rand(config_copy.float_input_dim).astype(np.float32),
         )
     # game_instance_manager.update_current_zone_idx(0, zone_centers, np.zeros(3))
 
