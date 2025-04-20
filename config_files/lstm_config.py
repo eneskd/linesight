@@ -24,6 +24,9 @@ lstm_seq_len = 16
 
 gamma = 0.99
 
+# Target network update frequency (in training steps)
+target_update_frequency = 1000  # Update target network every 1000 steps
+
 # Optionally, you can add more LSTM-specific settings here as needed
 
 def get_lstm_mlp_hidden_dims():

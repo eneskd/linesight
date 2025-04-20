@@ -50,6 +50,77 @@ def collector_process_fn(
             self.epsilon = 0.1
             self.is_explo = True
             self.hidden = None
+            
+            # Add counters for diagnostics
+            self.steps_since_reset = 0
+            self.total_resets = 0
+            self.reset_reasons = {
+                'collision': 0,
+                'stationary': 0,
+                'checkpoint': 0,
+                'timeout': 0,
+                'lap_complete': 0,
+                'forced': 0
+            }
+            self.stationary_counter = 0
+
+        def reset_hidden_state(self):
+            """Reset the hidden state to zeros."""
+            self.hidden = None
+            self.steps_since_reset = 0
+            self.total_resets += 1
+            
+        def should_reset_hidden(self, info=None):
+            """
+            Determine if hidden state should be reset based on environment info.
+            
+            Args:
+                info: Dictionary with environment info that may contain reset signals
+                    like collision detection, timeout, or checkpoint crossing
+            
+            Returns:
+                bool: True if hidden state should be reset
+            """
+            if info is None:
+                return False
+                
+            # Get configuration options or use defaults
+            reset_on_collision = getattr(config_copy, 'reset_hidden_on_collision', True)
+            reset_frequency = getattr(config_copy, 'reset_hidden_frequency', 500)
+            stationary_threshold = getattr(config_copy, 'stationary_threshold', 0.5)
+            stationary_patience = getattr(config_copy, 'stationary_patience', 10)
+            
+            # Check various reset conditions
+            if reset_on_collision and info.get('collision', False):
+                self.reset_reasons['collision'] += 1
+                return True
+                
+            # Car has been stationary or moving very slowly for too long
+            if info.get('speed', 1.0) < stationary_threshold:
+                self.stationary_counter += 1
+                    
+                if self.stationary_counter >= stationary_patience:
+                    self.reset_reasons['stationary'] += 1
+                    self.stationary_counter = 0
+                    return True
+            else:
+                self.stationary_counter = 0
+                
+            # Car has completed a lap or crossed checkpoints in wrong order
+            if info.get('wrong_checkpoint', False):
+                self.reset_reasons['checkpoint'] += 1
+                return True
+                
+            if info.get('lap_complete', False):
+                self.reset_reasons['lap_complete'] += 1
+                return True
+                
+            # Force reset after a certain number of steps to prevent state drift
+            if self.steps_since_reset >= reset_frequency:
+                self.reset_reasons['forced'] += 1
+                return True
+                
+            return False
 
         def preprocess_img(self, img):
             # (H, W) -> (1, H, W)
@@ -62,9 +133,14 @@ def collector_process_fn(
                 img = np.transpose(img, (2, 0, 1))
             return img.astype(np.float32)
 
-        def get_exploration_action(self, img_seq, float_inputs_seq):
+        def get_exploration_action(self, img_seq, float_inputs_seq, info=None):
             # img_seq: list of np.ndarray (H, W) or (1, H, W)
             # float_inputs_seq: list of np.ndarray (float_input_dim,)
+            
+            # Check if we should reset hidden state
+            if self.should_reset_hidden(info):
+                self.reset_hidden_state()
+                
             seq_len = len(img_seq)
             imgs = np.stack([self.preprocess_img(img) for img in img_seq])  # (seq_len, 1, H, W)
             floats = np.stack(float_inputs_seq)  # (seq_len, float_input_dim)
@@ -77,7 +153,18 @@ def collector_process_fn(
                     action = np.random.randint(self.n_actions)
                     return action, False, 0.0, np.zeros(self.n_actions, dtype=np.float32)
                 action = int(torch.argmax(q_values).item())
+                
+                # Increment steps since last reset
+                self.steps_since_reset += 1
                 return action, True, float(q_values[action].item()), q_values.cpu().numpy()
+                
+        def get_reset_stats(self):
+            """Return statistics about hidden state resets for monitoring"""
+            return {
+                'total_resets': self.total_resets,
+                'reset_reasons': self.reset_reasons,
+                'steps_since_reset': self.steps_since_reset
+            }
 
     inferer = LSTMInferer(inference_network, n_actions=len(config_copy.inputs))
 
@@ -129,7 +216,9 @@ def collector_process_fn(
 
         # The rollout function should be adapted to support sequence-based agents
         rollout_results, end_race_stats = tmi.rollout(
-            exploration_policy=inferer.get_exploration_action,
+            exploration_policy=lambda img_seq, float_inputs_seq: inferer.get_exploration_action(
+                img_seq, float_inputs_seq, end_race_stats if 'end_race_stats' in locals() else None
+            ),
             map_path=map_path,
             zone_centers=zone_centers,
             update_network=update_network,
@@ -137,6 +226,10 @@ def collector_process_fn(
         rollout_end_time = time.perf_counter()
         rollout_duration = rollout_end_time - rollout_start_time
         rollout_results["worker_time_in_rollout_percentage"] = rollout_duration / (time.perf_counter() - time_since_last_queue_push)
+        
+        # Add hidden state reset statistics to rollout results
+        reset_stats = inferer.get_reset_stats()
+        rollout_results["hidden_state_resets"] = reset_stats
         time_since_last_queue_push = time.perf_counter()
         print("", flush=True)
 

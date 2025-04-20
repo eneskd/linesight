@@ -25,16 +25,31 @@ from trackmania_rl.buffer_utilities import make_buffers, resize_buffers
 
 
 
-def dqn_loss(q_values, actions, targets):
+def dqn_loss(q_values, actions, targets, weights=None):
     """
-    Standard DQN loss: MSE between Q(s,a) and target.
-    q_values: (batch_size, n_actions)
-    actions: (batch_size,) int64
-    targets: (batch_size,) float32
+    Standard DQN loss: MSE between Q(s,a) and target, with optional importance sampling weights.
+    
+    Args:
+        q_values: (batch_size, n_actions) Q-values from the network
+        actions: (batch_size,) int64 actions that were taken
+        targets: (batch_size,) float32 target values
+        weights: (batch_size,) importance sampling weights for prioritized replay
+        
+    Returns:
+        Scalar loss value and TD errors for priority updates
     """
-
     q_selected = q_values.gather(1, actions.unsqueeze(1).long()).squeeze(1)
-    return torch.nn.functional.mse_loss(q_selected, targets)
+    
+    # Calculate TD error
+    td_error = q_selected - targets
+    
+    # If weights are provided, apply them to the squared error
+    if weights is not None:
+        # Element-wise multiplication with weights before mean
+        return (weights * td_error.pow(2)).mean(), td_error.detach().abs()
+    else:
+        # Standard MSE loss
+        return td_error.pow(2).mean(), td_error.detach().abs()
 
 def learner_process_fn(
     rollout_queues,
@@ -80,7 +95,7 @@ def learner_process_fn(
     time_waited_for_workers_since_last_tensorboard_write = 0
     time_training_since_last_tensorboard_write = 0
     time_testing_since_last_tensorboard_write = 0
-    
+
     # Create save directory if it doesn't exist
     save_dir.mkdir(parents=True, exist_ok=True)
 
@@ -107,7 +122,7 @@ def learner_process_fn(
             checkpoint_loaded = True
         except Exception as e:
             print(f" Error loading checkpoint from {latest_checkpoint}: {e}")
-    
+
     # Fall back to individual files if checkpoint loading failed
     if not checkpoint_loaded:
         try:
@@ -218,7 +233,6 @@ def learner_process_fn(
                 print(f"  fill_buffer stats: status={fill_buffer}")
                 break
 
-        print("after fill")
         importlib.reload(config_copy)
 
         new_tensorboard_suffix = utilities.from_staircase_schedule(
@@ -263,7 +277,6 @@ def learner_process_fn(
         # ===============================================
         #   FILL BUFFER WITH (S, A, R, S') transitions
         # ===============================================
-        print(fill_buffer)
 
         if fill_buffer:
             current_step = accumulated_stats["cumul_number_frames_played"]
@@ -305,7 +318,6 @@ def learner_process_fn(
             accumulated_stats["cumul_number_single_memories_should_have_been_used"] += (
                     config_copy.number_times_single_memory_is_used_before_discard * number_memories_added_train
             )
-            print(f" NMG={accumulated_stats['cumul_number_memories_generated']:<8}")
 
         # ===============================================
         #   LEARN ON BATCH
@@ -337,17 +349,74 @@ def learner_process_fn(
         ):
             train_start_time = time.perf_counter()
             optimizer1.zero_grad(set_to_none=True)
-            batch, batch_info = buffer.sample(config_copy.batch_size, return_info=True)
-            (
-                state_img_tensor,         # (batch_size, 1, H, W)
-                state_float_tensor,       # (batch_size, float_input_dim)
-                actions,
-                rewards,
-                next_state_img_tensor,    # (batch_size, 1, H, W)
-                next_state_float_tensor,  # (batch_size, float_input_dim)
-                gammas_terminal,
-            ) = batch
 
+
+            print(accumulated_stats["cumul_number_single_memories_used"] + offset_cumul_number_single_memories_used)
+            print(accumulated_stats["cumul_number_single_memories_should_have_been_used"])
+
+            # Use improved sampling strategy if available
+            # Sample batch from buffer
+            if hasattr(buffer, "sample_batch_with_improved_strategy"):
+                # Dictionary-style batch
+                try:
+                    batch = buffer.sample_batch_with_improved_strategy(config_copy.batch_size)
+                    batch_info = {"indices": batch.pop("indices")} if "indices" in batch else {}
+
+                    # Extract tensors from batch dictionary
+                    state_img_tensor = batch["state_img_tensor"]
+                    state_float_tensor = batch["state_float_tensor"]
+                    actions = batch["actions"]
+                    rewards = batch["rewards"]
+                    next_state_img_tensor = batch["next_state_img_tensor"]
+                    next_state_float_tensor = batch["next_state_float_tensor"]
+                    gammas_terminal = batch["gammas_terminal"]
+
+                    # Get weights for prioritized replay if available
+                    weights = batch.get("weights", torch.ones_like(rewards))
+                except (KeyError, AttributeError) as e:
+                    print(f"Warning: Dictionary-style batch sampling failed with {e}, falling back to tuple sampling")
+                    batch, batch_info = buffer.sample(config_copy.batch_size, return_info=True)
+
+                    # Standard 7-tuple unpacking
+                    (
+                        state_img_tensor,
+                        state_float_tensor,
+                        actions,
+                        rewards,
+                        next_state_img_tensor,
+                        next_state_float_tensor,
+                        gammas_terminal,
+                    ) = batch
+
+                    # Default weights (no prioritization)
+                    weights = torch.ones_like(rewards)
+            else:
+                # Standard tuple-style batch
+                batch, batch_info = buffer.sample(config_copy.batch_size, return_info=True)
+
+                # Standard 7-tuple unpacking
+                (
+                    state_img_tensor,
+                    state_float_tensor,
+                    actions,
+                    rewards,
+                    next_state_img_tensor,
+                    next_state_float_tensor,
+                    gammas_terminal,
+                ) = batch
+
+                # Default weights (no prioritization)
+                weights = torch.ones_like(rewards)
+
+            reward_mean = rewards.mean().item()
+            reward_min = rewards.min().item()
+            reward_max = rewards.max().item()
+            reward_std = rewards.std().item()
+            print(
+                f"    Rewards - mean: {reward_mean:.6f}, min: {reward_min:.6f}, max: {reward_max:.6f}, std: {reward_std:.6f}")
+
+            # If you want to see individual rewards (first 5 of the batch)
+            print(f"    First 5 rewards: {rewards[:5].cpu().numpy().tolist()}")
             accumulated_stats["cumul_number_single_memories_used"] += (
                 4 * config_copy.batch_size
                 if (len(buffer) < buffer._storage.max_size and buffer._storage.max_size > 200_000)
@@ -369,7 +438,12 @@ def learner_process_fn(
                     max_next_q = q_next.max(dim=1)[0]
                     targets = rewards + gammas_terminal * max_next_q
 
-                loss = dqn_loss(q_values, actions, targets)
+                # Calculate loss with proper weight handling
+                loss, td_errors = dqn_loss(q_values, actions, targets, weights)
+                
+                # Update priorities if using prioritized replay
+                if "indices" in batch_info and hasattr(buffer._sampler, "update_priorities"):
+                    buffer._sampler.update_priorities(batch_info["indices"], td_errors.cpu().numpy())
 
             scaler.scale(loss).backward()
             scaler.unscale_(optimizer1)
@@ -396,27 +470,27 @@ def learner_process_fn(
             # Update accumulated stats
             train_duration_ms = (time.perf_counter() - train_start_time) * 1000
             train_on_batch_duration_history.append(train_duration_ms / 1000)  # Convert back to seconds for history
-            
+
             # Update cumulative counters
             accumulated_stats["cumul_number_single_memories_used"] += config_copy.batch_size
             accumulated_stats["cumul_number_batches_done"] += 1
-            
+
             # Update rolling mean statistics
             if "rolling_mean_ms" not in accumulated_stats:
                 accumulated_stats["rolling_mean_ms"] = {}
-            
+
             # Update rolling mean for training step time
             key = "train_step"
             prev_mean = accumulated_stats["rolling_mean_ms"].get(key, 0)
             alpha = 0.01  # smoothing factor
             accumulated_stats["rolling_mean_ms"][key] = (1 - alpha) * prev_mean + alpha * train_duration_ms
-            
+
             # Update all-time minimum if applicable
             if "alltime_min_ms" not in accumulated_stats:
                 accumulated_stats["alltime_min_ms"] = {}
             if key not in accumulated_stats["alltime_min_ms"] or train_duration_ms < accumulated_stats["alltime_min_ms"][key]:
                 accumulated_stats["alltime_min_ms"][key] = train_duration_ms
-            
+
             # Add to history for later analysis
             loss_history.append(loss.detach().cpu())
             if not math.isinf(grad_norm):
@@ -470,13 +544,13 @@ def learner_process_fn(
             tensorboard_writer.add_scalar('train/grad_norm', grad_norm, step)
             tensorboard_writer.add_scalar('train/max_next_q', max_next_q.mean().item(), step)
             tensorboard_writer.add_scalar('train/train_step_ms', train_duration_ms, step)
-            
+
             # Log rolling means
             for key, value in accumulated_stats["rolling_mean_ms"].items():
                 tensorboard_writer.add_scalar(f'rolling_mean_ms/{key}', value, step)
-            
+
             # Log end race stats if available
-            if end_race_stats:
+            if end_race_stats['race_finished']:
                 for k, v in end_race_stats.items():
                     if isinstance(v, (int, float)):
                         tensorboard_writer.add_scalar(f'race/{k}', v, step)
@@ -645,7 +719,7 @@ def learner_process_fn(
                     'step': accumulated_stats['cumul_number_frames_played'],
                     'stats': accumulated_stats
                 }, checkpoint_path)
-                
+
                 # Also save standard checkpoint files for backward compatibility
                 utilities.save_checkpoint(save_dir, online_network, target_network, optimizer1, scaler)
                 joblib.dump(accumulated_stats, save_dir / "accumulated_stats.joblib")
