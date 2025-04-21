@@ -530,8 +530,7 @@ def save_checkpoint(save_dir, online_network, target_network, optimizer, scaler,
         }, checkpoint_path)
 
         # Also save standard checkpoint files for backward compatibility
-        utilities.save_checkpoint(save_dir, online_network, target_network, optimizer, scaler)
-        joblib.dump(accumulated_stats, save_dir / "accumulated_stats.joblib")
+        utilities.save_checkpoint(save_dir, online_network, target_network, optimizer, scaler, accumulated_stats)
         print(f"Checkpoint saved at step {accumulated_stats['cumul_number_frames_played']}")
         return True
     except Exception as e:
