@@ -28,15 +28,15 @@ from config_files.user_config import *
 W_downsized = 160
 H_downsized = 120
 
-run_name = "mlp_test_003"
+run_name = "iqn_test_001"
 running_speed = 80
 
-agent_type = "mlp"  # "mlp", "iqn", "lstm"
+agent_type = "iqn"  # "mlp", "iqn", "lstm"
 
 
 
 prio_alpha = np.float32(0)  # Rainbow-IQN paper: 0.2, Rainbow paper: 0.5, PER paper 0.6
-prio_epsilon = np.float32(2e-3)  # Defaults to 10^-6 in stable-baselines
+prio_epsilon = np.float32(1e-6)  # Defaults to 10^-6 in stable-baselines
 prio_beta = np.float32(1)
 
 tm_engine_step_per_action = 5
@@ -99,9 +99,9 @@ reward_per_m_advanced_along_centerline = 15 / 500
 number_times_single_memory_is_used_before_discard = 32  # 32 // 4
 
 memory_size_schedule = [
-    (0, (50_000, 20_000)),
-    (5_000_000 * global_schedule_speed, (100_000, 75_000)),
-    (7_000_000 * global_schedule_speed, (200_000, 150_000)),
+    (0, (20_000, 10_000)),
+    (5_000_000 * global_schedule_speed, (40_000, 30_000)),
+    (7_000_000 * global_schedule_speed, (100_000, 50_000)),
 ]
 lr_schedule = [
     (0, 1e-3),
@@ -152,6 +152,7 @@ tmi_protection_timeout_s = 500
 game_reboot_interval = 3600 * 12  # In seconds
 
 frames_before_save_best_runs = 1_500_000
+save_frequency_s = 5 * 60
 
 plot_race_time_left_curves = False
 n_transitions_to_plot_in_distribution_curves = 1000

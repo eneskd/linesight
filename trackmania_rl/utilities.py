@@ -185,9 +185,11 @@ def save_checkpoint(
     target_network: torch.nn.Module,
     optimizer: torch.optim.Optimizer,
     scaler: torch.cuda.amp.GradScaler,
+    accumulated_stats: dict,
 ):
     checkpoint_dir.mkdir(parents=True, exist_ok=True)
     torch.save(online_network.state_dict(), checkpoint_dir / "weights1.torch")
     torch.save(target_network.state_dict(), checkpoint_dir / "weights2.torch")
     torch.save(optimizer.state_dict(), checkpoint_dir / "optimizer1.torch")
     torch.save(scaler.state_dict(), checkpoint_dir / "scaler.torch")
+    joblib.dump(accumulated_stats, checkpoint_dir / "accumulated_stats.joblib")
