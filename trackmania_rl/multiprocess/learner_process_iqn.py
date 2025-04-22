@@ -35,53 +35,34 @@ from trackmania_rl.analysis_metrics import (
 )
 from trackmania_rl.buffer_utilities import make_buffers, resize_buffers
 from trackmania_rl.map_reference_times import reference_times
+from trackmania_rl.multiprocess.learner_process_utils import (
+    setup_tensorboard,
+    load_checkpoint,
+    get_rollout_from_queues,
+    update_buffer_size,
+    log_training_step,
+    log_to_tensorboard,
+    collect_race_stats,
+    log_race_stats_to_tensorboard,
+    log_detailed_tensorboard_stats,
+    save_checkpoint,
+    update_target_network,
+    save_good_runs,
+)
 
 
-def setup_tensorboard(tensorboard_base_dir, layout_version="lay_mono"):
-    """Setup TensorBoard with custom layout."""
-    SummaryWriter(log_dir=str(tensorboard_base_dir / layout_version)).add_custom_scalars(
-        {
-            layout_version: {
-                "eval_race_time_robust": [
-                    "Multiline",
-                    [
-                        "eval_race_time_robust",
-                    ],
-                ],
-                "explo_race_time_finished": [
-                    "Multiline",
-                    [
-                        "explo_race_time_finished",
-                    ],
-                ],
-                "loss": ["Multiline", ["loss$", "loss_test$"]],
-                "avg_Q": [
-                    "Multiline",
-                    ["avg_Q"],
-                ],
-                "single_zone_reached": [
-                    "Multiline",
-                    [
-                        "single_zone_reached",
-                    ],
-                ],
-                "grad_norm_history": [
-                    "Multiline",
-                    [
-                        "grad_norm_history_d9",
-                        "grad_norm_history_d98",
-                    ],
-                ],
-                "priorities": [
-                    "Multiline",
-                    [
-                        "priorities",
-                    ],
-                ],
-            },
-        }
-    )
+def update_optimizer_params(optimizer, params, buffer):
+    """Update optimizer parameters and buffer settings."""
+    for param_group in optimizer.param_groups:
+        param_group["lr"] = params["learning_rate"]
+        param_group["epsilon"] = config_copy.adam_epsilon
+        param_group["betas"] = (config_copy.adam_beta1, config_copy.adam_beta2)
 
+    # Update prioritized sampler parameters if applicable
+    if isinstance(buffer._sampler, PrioritizedSampler):
+        buffer._sampler._alpha = config_copy.prio_alpha
+        buffer._sampler._beta = config_copy.prio_beta
+        buffer._sampler._eps = config_copy.prio_epsilon
 
 def initialize_networks_and_optimizer(accumulated_stats):
     """Initialize models and optimizer."""
@@ -103,77 +84,31 @@ def initialize_networks_and_optimizer(accumulated_stats):
     scaler = torch.amp.GradScaler("cuda")
     return online_network, uncompiled_online_network, target_network, optimizer, scaler
 
+def process_rollout(rollout_results, buffer, buffer_test, params, accumulated_stats):
+    """Process rollout data and fill buffer with transitions."""
+    # Fill buffer with transitions
+    buffer, buffer_test, number_memories_added_train, number_memories_added_test = (
+        buffer_management.fill_buffer_from_rollout_with_n_steps_rule(
+            buffer,
+            buffer_test,
+            rollout_results,
+            config_copy.n_steps,
+            params["gamma"],
+            config_copy.discard_non_greedy_actions_in_nsteps,
+            params["engineered_speedslide_reward"],
+            params["engineered_neoslide_reward"],
+            params["engineered_kamikaze_reward"],
+            params["engineered_close_to_vcp_reward"],
+        )
+    )
 
-def load_checkpoint(save_dir, online_network, target_network, optimizer, scaler, accumulated_stats, shared_steps):
-    """Load checkpoint if available."""
-    try:
-        online_network.load_state_dict(torch.load(f=save_dir / "weights1.torch", weights_only=False))
-        target_network.load_state_dict(torch.load(f=save_dir / "weights2.torch", weights_only=False))
-        print(" =====================     Learner weights loaded !     ============================")
-        try:
-            optimizer.load_state_dict(torch.load(f=save_dir / "optimizer1.torch", weights_only=False))
-            scaler.load_state_dict(torch.load(f=save_dir / "scaler.torch", weights_only=False))
-            print(" =========================     Optimizer loaded !     ================================")
-        except Exception as e:
-            print(f" Could not load optimizer: {e}")
-        try:
-            stats = joblib.load(save_dir / "accumulated_stats.joblib")
-            accumulated_stats.update(stats)
-            shared_steps.value = accumulated_stats["cumul_number_frames_played"]
-            print(" =====================      Learner stats loaded !      ============================")
-        except Exception as e:
-            print(f" Learner could not load stats: {e}")
-        return True
-    except Exception as e:
-        print(f" Learner could not load weights: {e}")
+    # Update accumulated stats
+    accumulated_stats["cumul_number_memories_generated"] += number_memories_added_train + number_memories_added_test
+    accumulated_stats["cumul_number_single_memories_should_have_been_used"] += (
+            config_copy.number_times_single_memory_is_used_before_discard * number_memories_added_train
+    )
 
-    # Try to load consolidated checkpoint
-    checkpoint_files = list(save_dir.glob("checkpoint_step_*.pt"))
-    if checkpoint_files:
-        latest_checkpoint = max(checkpoint_files, key=lambda p: int(p.stem.split('_')[-1]))
-        try:
-            checkpoint = torch.load(latest_checkpoint)
-            online_network.load_state_dict(checkpoint['online_network'])
-            target_network.load_state_dict(checkpoint['target_network'])
-            accumulated_stats.update(checkpoint['stats'])
-            optimizer.load_state_dict(checkpoint['optimizer'])
-            scaler.load_state_dict(checkpoint['scaler'])
-            shared_steps.value = accumulated_stats["cumul_number_frames_played"]
-            print(f" ===================== Loaded checkpoint from {latest_checkpoint} ============================")
-            print(
-                f" ===================== Resumed from step {accumulated_stats['cumul_number_frames_played']} ============================")
-            return True
-        except Exception as e:
-            print(f" Error loading checkpoint from {latest_checkpoint}: {e}")
-            return False
-
-    return False
-
-
-def get_rollout_from_queues(rollout_queues, queue_check_order):
-    """Get rollout data from worker queues."""
-    for idx in queue_check_order:
-        if not rollout_queues[idx].empty():
-            rollout_data = rollout_queues[idx].get()
-            # Move this queue to the end for round-robin queue checking
-            queue_check_order.append(queue_check_order.pop(queue_check_order.index(idx)))
-            (
-                rollout_results,
-                end_race_stats,
-                fill_buffer,
-                is_explo,
-                map_name,
-                map_status,
-                rollout_duration,
-                loop_number,
-            ) = rollout_data
-            print(
-                f"  Map: {map_name}, Explo: {is_explo}, Loop: {loop_number}, Rollout duration: {rollout_duration:.2f}s")
-            print(
-                f"  Rollout stats: status={map_status}, end_race_stats_keys={list(end_race_stats.keys()) if end_race_stats and end_race_stats.get('race_finished', False) else None}")
-            print(f"  fill_buffer stats: status={fill_buffer}")
-            return rollout_data, idx
-    return None, -1
+    return buffer, buffer_test, number_memories_added_train
 
 
 def update_config_parameters(accumulated_stats):
@@ -229,64 +164,11 @@ def update_config_parameters(accumulated_stats):
     }
 
 
-def update_buffer_size(buffer, buffer_test, memory_size, new_memory_size, memory_size_start_learn,
-                       new_memory_size_start_learn, offset_cumul_number_single_memories_used):
-    """Update buffer size if needed."""
-    if new_memory_size != memory_size:
-        buffer, buffer_test = resize_buffers(buffer, buffer_test, new_memory_size)
-        offset_adjustment = (
-                                    new_memory_size_start_learn - memory_size_start_learn
-                            ) * config_copy.number_times_single_memory_is_used_before_discard
-        offset_cumul_number_single_memories_used += offset_adjustment
-        return buffer, buffer_test, new_memory_size, new_memory_size_start_learn, offset_cumul_number_single_memories_used
-    return buffer, buffer_test, memory_size, memory_size_start_learn, offset_cumul_number_single_memories_used
 
-
-def update_optimizer_params(optimizer, params, buffer):
-    """Update optimizer parameters and buffer settings."""
-    for param_group in optimizer.param_groups:
-        param_group["lr"] = params["learning_rate"]
-        param_group["epsilon"] = config_copy.adam_epsilon
-        param_group["betas"] = (config_copy.adam_beta1, config_copy.adam_beta2)
-
-    # Update prioritized sampler parameters if applicable
-    if isinstance(buffer._sampler, PrioritizedSampler):
-        buffer._sampler._alpha = config_copy.prio_alpha
-        buffer._sampler._beta = config_copy.prio_beta
-        buffer._sampler._eps = config_copy.prio_epsilon
-
-
-def process_rollout(rollout_results, buffer, buffer_test, params, accumulated_stats):
-    """Process rollout data and fill buffer with transitions."""
-    # Fill buffer with transitions
-    buffer, buffer_test, number_memories_added_train, number_memories_added_test = (
-        buffer_management.fill_buffer_from_rollout_with_n_steps_rule(
-            buffer,
-            buffer_test,
-            rollout_results,
-            config_copy.n_steps,
-            params["gamma"],
-            config_copy.discard_non_greedy_actions_in_nsteps,
-            params["engineered_speedslide_reward"],
-            params["engineered_neoslide_reward"],
-            params["engineered_kamikaze_reward"],
-            params["engineered_close_to_vcp_reward"],
-        )
-    )
-
-    # Update accumulated stats
-    accumulated_stats["cumul_number_memories_generated"] += number_memories_added_train + number_memories_added_test
-    accumulated_stats["cumul_number_single_memories_should_have_been_used"] += (
-            config_copy.number_times_single_memory_is_used_before_discard * number_memories_added_train
-    )
-
-    return buffer, buffer_test, number_memories_added_train
-
-
-def collect_periodic_stats(accumulated_stats, loss_history, train_on_batch_duration_history, grad_norm_history,
-                           layer_grad_norm_history, buffer, gamma, learning_rate, weight_decay,
-                           time_waited_for_workers, time_training, time_testing, time_since_last_save,
-                           transitions_learned_last_save, epsilon, epsilon_boltzmann):
+def collect_periodic_stats_iqn(accumulated_stats, loss_history, train_on_batch_duration_history, grad_norm_history,
+                               layer_grad_norm_history, buffer, gamma, learning_rate, weight_decay,
+                               time_waited_for_workers, time_training, time_testing, time_since_last_save,
+                               transitions_learned_last_save, epsilon, epsilon_boltzmann):
     """Collect statistics for periodic reporting and saving."""
     transitions_learned_per_second = (
                                              accumulated_stats[
@@ -368,230 +250,7 @@ def collect_periodic_stats(accumulated_stats, loss_history, train_on_batch_durat
     return step_stats
 
 
-def update_target_network(target_network, online_network, accumulated_stats):
-    """Update target network if conditions are met."""
-    if (accumulated_stats["cumul_number_single_memories_used"]
-            >= accumulated_stats.get("cumul_number_single_memories_used_next_target_network_update", 0)):
-        accumulated_stats["cumul_number_target_network_updates"] = accumulated_stats.get(
-            "cumul_number_target_network_updates", 0) + 1
-        accumulated_stats["cumul_number_single_memories_used_next_target_network_update"] = (
-                accumulated_stats.get("cumul_number_single_memories_used_next_target_network_update", 0) +
-                config_copy.number_memories_trained_on_between_target_network_updates
-        )
-        utilities.soft_copy_param(target_network, online_network, config_copy.soft_update_tau)
 
-
-def save_checkpoint(save_dir, online_network, target_network, optimizer, scaler, accumulated_stats):
-    """Save checkpoint with model weights, optimizer state, and statistics."""
-    checkpoint_path = save_dir / f"checkpoint_step_{accumulated_stats['cumul_number_frames_played']}.pt"
-    try:
-        # Save consolidated checkpoint
-        torch.save({
-            'online_network': online_network.state_dict(),
-            'target_network': target_network.state_dict(),
-            'optimizer': optimizer.state_dict(),
-            'scaler': scaler.state_dict(),
-            'step': accumulated_stats['cumul_number_frames_played'],
-            'stats': accumulated_stats
-        }, checkpoint_path)
-
-        # Also save standard checkpoint files for backward compatibility
-        utilities.save_checkpoint(save_dir, online_network, target_network, optimizer, scaler, accumulated_stats)
-        print(f"Checkpoint saved at step {accumulated_stats['cumul_number_frames_played']}")
-    except Exception as e:
-        print(f"Error saving checkpoint: {e}")
-
-
-def log_detailed_tensorboard_stats(tensorboard_writer, online_network, optimizer, accumulated_stats, step_stats,
-                                   previous_alltime_min, frame_count):
-    """Log detailed statistics to TensorBoard periodically."""
-    walltime_tb = time.time()
-
-    # Log layer L2 norms
-    for name, param in online_network.named_parameters():
-        tensorboard_writer.add_scalar(
-            tag=f"layer_{name}_L2",
-            scalar_value=np.sqrt((param ** 2).mean().detach().cpu().item()),
-            global_step=frame_count,
-            walltime=walltime_tb,
-        )
-
-    # Log optimizer state
-    try:
-        assert len(optimizer.param_groups) == 1
-        for p, (name, _) in zip(
-                optimizer.param_groups[0]["params"],
-                online_network.named_parameters(),
-        ):
-            state = optimizer.state[p]
-            exp_avg, exp_avg_sq = state["exp_avg"], state["exp_avg_sq"]
-            mod_lr = 1 / (exp_avg_sq.sqrt() + 1e-4)
-            tensorboard_writer.add_scalar(
-                tag=f"lr_ratio_{name}_L2",
-                scalar_value=np.sqrt((mod_lr ** 2).mean().detach().cpu().item()),
-                global_step=frame_count,
-                walltime=walltime_tb,
-            )
-            tensorboard_writer.add_scalar(
-                tag=f"exp_avg_{name}_L2",
-                scalar_value=np.sqrt((exp_avg ** 2).mean().detach().cpu().item()),
-                global_step=frame_count,
-                walltime=walltime_tb,
-            )
-            tensorboard_writer.add_scalar(
-                tag=f"exp_avg_sq_{name}_L2",
-                scalar_value=np.sqrt((exp_avg_sq ** 2).mean().detach().cpu().item()),
-                global_step=frame_count,
-                walltime=walltime_tb,
-            )
-    except Exception:
-        pass
-
-    # Log all stats
-    for k, v in step_stats.items():
-        tensorboard_writer.add_scalar(
-            tag=k,
-            scalar_value=v,
-            global_step=frame_count,
-            walltime=walltime_tb,
-        )
-
-    # Log time summary comparison with previous mins
-    previous_alltime_min = previous_alltime_min or copy.deepcopy(accumulated_stats["alltime_min_ms"])
-    times_summary = f"{datetime.now().strftime('%Y/%m/%d, %H:%M:%S')} " + " ".join(
-        [
-            f"{'**' if v < previous_alltime_min.get(k, 99999999) else ''}{k}: {v / 1000:.2f}{'**' if v < previous_alltime_min.get(k, 99999999) else ''}"
-            for k, v in accumulated_stats["alltime_min_ms"].items()
-        ]
-    )
-    tensorboard_writer.add_text(
-        "times_summary",
-        times_summary,
-        global_step=frame_count,
-        walltime=walltime_tb,
-    )
-
-    return copy.deepcopy(accumulated_stats["alltime_min_ms"])
-
-
-def log_race_stats_to_tensorboard(tensorboard_writer, race_stats_to_write, accumulated_stats):
-    """Log race statistics to TensorBoard."""
-    walltime_tb = time.time()
-    for tag, value in race_stats_to_write.items():
-        tensorboard_writer.add_scalar(
-            tag=tag,
-            scalar_value=value,
-            global_step=accumulated_stats["cumul_number_frames_played"],
-            walltime=walltime_tb,
-        )
-
-
-def collect_race_stats(rollout_results, end_race_stats, is_explo, map_name, map_status, rollout_duration,
-                       accumulated_stats):
-    """Collect statistics from a completed race."""
-    race_stats_to_write = {
-        f"race_time_ratio_{map_name}": end_race_stats["race_time_for_ratio"] / (rollout_duration * 1000),
-        f"explo_race_time_{map_status}_{map_name}" if is_explo else f"eval_race_time_{map_status}_{map_name}":
-            end_race_stats[
-                "race_time"
-            ]
-            / 1000,
-        f"explo_race_finished_{map_status}_{map_name}" if is_explo else f"eval_race_finished_{map_status}_{map_name}":
-            end_race_stats[
-                "race_finished"
-            ],
-        f"mean_action_gap_{map_name}": -(
-                np.array(rollout_results["q_values"]) - np.array(rollout_results["q_values"]).max(axis=1,
-                                                                                                  initial=None).reshape(
-            -1, 1)
-        ).mean(),
-        f"single_zone_reached_{map_status}_{map_name}": rollout_results["furthest_zone_idx"],
-        "instrumentation__answer_normal_step": end_race_stats["instrumentation__answer_normal_step"],
-        "instrumentation__answer_action_step": end_race_stats["instrumentation__answer_action_step"],
-        "instrumentation__between_run_steps": end_race_stats["instrumentation__between_run_steps"],
-        "instrumentation__grab_frame": end_race_stats["instrumentation__grab_frame"],
-        "instrumentation__convert_frame": end_race_stats["instrumentation__convert_frame"],
-        "instrumentation__grab_floats": end_race_stats["instrumentation__grab_floats"],
-        "instrumentation__exploration_policy": end_race_stats["instrumentation__exploration_policy"],
-        "instrumentation__request_inputs_and_speed": end_race_stats["instrumentation__request_inputs_and_speed"],
-        "tmi_protection_cutoff": end_race_stats["tmi_protection_cutoff"],
-        "worker_time_in_rollout_percentage": rollout_results["worker_time_in_rollout_percentage"],
-    }
-
-    if not is_explo:
-        race_stats_to_write[f"avg_Q_{map_status}_{map_name}"] = np.mean(rollout_results["q_values"])
-
-    if end_race_stats["race_finished"]:
-        race_stats_to_write[f"{'explo' if is_explo else 'eval'}_race_time_finished_{map_status}_{map_name}"] = (
-                end_race_stats["race_time"] / 1000
-        )
-        if not is_explo:
-            accumulated_stats["rolling_mean_ms"][map_name] = (
-                    accumulated_stats["rolling_mean_ms"].get(map_name,
-                                                             config_copy.cutoff_rollout_if_race_not_finished_within_duration_ms)
-                    * 0.9
-                    + end_race_stats["race_time"] * 0.1
-            )
-
-    if (
-            (not is_explo)
-            and end_race_stats["race_finished"]
-            and end_race_stats["race_time"] < 1.02 * accumulated_stats["rolling_mean_ms"][map_name]
-    ):
-        race_stats_to_write[f"eval_race_time_robust_{map_status}_{map_name}"] = end_race_stats["race_time"] / 1000
-        if map_name in reference_times:
-            for reference_time_name in ["author", "gold"]:
-                if reference_time_name in reference_times[map_name]:
-                    reference_time = reference_times[map_name][reference_time_name]
-                    race_stats_to_write[f"eval_ratio_{map_status}_{reference_time_name}_{map_name}"] = (
-                            100 * (end_race_stats["race_time"] / 1000) / reference_time
-                    )
-                    race_stats_to_write[f"eval_agg_ratio_{map_status}_{reference_time_name}"] = (
-                            100 * (end_race_stats["race_time"] / 1000) / reference_time
-                    )
-
-    for i in [0]:
-        race_stats_to_write[f"q_value_{i}_starting_frame_{map_name}"] = end_race_stats[f"q_value_{i}_starting_frame"]
-
-    if not is_explo:
-        for i, split_time in enumerate(
-                [
-                    (e - s) / 1000
-                    for s, e in zip(
-                    end_race_stats["cp_time_ms"][:-1],
-                    end_race_stats["cp_time_ms"][1:],
-                )
-                ]
-        ):
-            race_stats_to_write[f"split_{map_name}_{i}"] = split_time
-
-    return race_stats_to_write
-
-
-def save_good_runs(base_dir, save_dir, rollout_results, end_race_stats, map_name, is_explo, accumulated_stats):
-    """Save good runs based on race time."""
-    if end_race_stats["race_time"] < accumulated_stats["alltime_min_ms"].get(map_name, 99999999999):
-        # This is a new alltime_minimum
-        accumulated_stats["alltime_min_ms"][map_name] = end_race_stats["race_time"]
-        if accumulated_stats["cumul_number_frames_played"] > config_copy.frames_before_save_best_runs:
-            name = f"{map_name}_{end_race_stats['race_time']}"
-            utilities.save_run(
-                base_dir,
-                save_dir / "best_runs" / name,
-                rollout_results,
-                f"{name}.inputs",
-                inputs_only=False,
-            )
-
-    if end_race_stats["race_time"] < config_copy.threshold_to_save_all_runs_ms:
-        name = f"{map_name}_{end_race_stats['race_time']}_{datetime.now().strftime('%m%d_%H%M%S')}_{accumulated_stats['cumul_number_frames_played']}_{'explo' if is_explo else 'eval'}"
-        utilities.save_run(
-            base_dir,
-            save_dir / "good_runs",
-            rollout_results,
-            f"{name}.inputs",
-            inputs_only=True,
-        )
 
 
 def learner_process_fn(
@@ -894,7 +553,7 @@ def learner_process_fn(
 
 
             # Collect statistics
-            step_stats = collect_periodic_stats(
+            step_stats = collect_periodic_stats_iqn(
                 accumulated_stats,
                 loss_history,
                 train_on_batch_duration_history,

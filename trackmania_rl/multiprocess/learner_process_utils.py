@@ -19,6 +19,7 @@ from torchrl.data.replay_buffers import PrioritizedSampler
 
 from config_files import config_copy
 from trackmania_rl import buffer_management, utilities
+from trackmania_rl.map_reference_times import reference_times
 from trackmania_rl.buffer_utilities import make_buffers, resize_buffers
 
 
@@ -551,3 +552,98 @@ def save_good_runs(base_dir, save_dir, rollout_results, end_race_stats, map_name
             f"{name}.inputs",
             inputs_only=True,
         )
+
+
+
+def log_race_stats_to_tensorboard(tensorboard_writer, race_stats_to_write, accumulated_stats):
+    """Log race statistics to TensorBoard."""
+    walltime_tb = time.time()
+    for tag, value in race_stats_to_write.items():
+        tensorboard_writer.add_scalar(
+            tag=tag,
+            scalar_value=value,
+            global_step=accumulated_stats["cumul_number_frames_played"],
+            walltime=walltime_tb,
+        )
+
+
+def collect_race_stats(rollout_results, end_race_stats, is_explo, map_name, map_status, rollout_duration,
+                       accumulated_stats):
+    """Collect statistics from a completed race."""
+    race_stats_to_write = {
+        f"race_time_ratio_{map_name}": end_race_stats["race_time_for_ratio"] / (rollout_duration * 1000),
+        f"explo_race_time_{map_status}_{map_name}" if is_explo else f"eval_race_time_{map_status}_{map_name}":
+            end_race_stats[
+                "race_time"
+            ]
+            / 1000,
+        f"explo_race_finished_{map_status}_{map_name}" if is_explo else f"eval_race_finished_{map_status}_{map_name}":
+            end_race_stats[
+                "race_finished"
+            ],
+        f"mean_action_gap_{map_name}": -(
+                np.array(rollout_results["q_values"]) - np.array(rollout_results["q_values"]).max(axis=1,
+                                                                                                  initial=None).reshape(
+            -1, 1)
+        ).mean(),
+        f"single_zone_reached_{map_status}_{map_name}": rollout_results["furthest_zone_idx"],
+        "instrumentation__answer_normal_step": end_race_stats["instrumentation__answer_normal_step"],
+        "instrumentation__answer_action_step": end_race_stats["instrumentation__answer_action_step"],
+        "instrumentation__between_run_steps": end_race_stats["instrumentation__between_run_steps"],
+        "instrumentation__grab_frame": end_race_stats["instrumentation__grab_frame"],
+        "instrumentation__convert_frame": end_race_stats["instrumentation__convert_frame"],
+        "instrumentation__grab_floats": end_race_stats["instrumentation__grab_floats"],
+        "instrumentation__exploration_policy": end_race_stats["instrumentation__exploration_policy"],
+        "instrumentation__request_inputs_and_speed": end_race_stats["instrumentation__request_inputs_and_speed"],
+        "tmi_protection_cutoff": end_race_stats["tmi_protection_cutoff"],
+        "worker_time_in_rollout_percentage": rollout_results["worker_time_in_rollout_percentage"],
+    }
+
+    if not is_explo:
+        race_stats_to_write[f"avg_Q_{map_status}_{map_name}"] = np.mean(rollout_results["q_values"])
+
+    if end_race_stats["race_finished"]:
+        race_stats_to_write[f"{'explo' if is_explo else 'eval'}_race_time_finished_{map_status}_{map_name}"] = (
+                end_race_stats["race_time"] / 1000
+        )
+        if not is_explo:
+            accumulated_stats["rolling_mean_ms"][map_name] = (
+                    accumulated_stats["rolling_mean_ms"].get(map_name,
+                                                             config_copy.cutoff_rollout_if_race_not_finished_within_duration_ms)
+                    * 0.9
+                    + end_race_stats["race_time"] * 0.1
+            )
+
+    if (
+            (not is_explo)
+            and end_race_stats["race_finished"]
+            and end_race_stats["race_time"] < 1.02 * accumulated_stats["rolling_mean_ms"][map_name]
+    ):
+        race_stats_to_write[f"eval_race_time_robust_{map_status}_{map_name}"] = end_race_stats["race_time"] / 1000
+        if map_name in reference_times:
+            for reference_time_name in ["author", "gold"]:
+                if reference_time_name in reference_times[map_name]:
+                    reference_time = reference_times[map_name][reference_time_name]
+                    race_stats_to_write[f"eval_ratio_{map_status}_{reference_time_name}_{map_name}"] = (
+                            100 * (end_race_stats["race_time"] / 1000) / reference_time
+                    )
+                    race_stats_to_write[f"eval_agg_ratio_{map_status}_{reference_time_name}"] = (
+                            100 * (end_race_stats["race_time"] / 1000) / reference_time
+                    )
+
+    for i in [0]:
+        race_stats_to_write[f"q_value_{i}_starting_frame_{map_name}"] = end_race_stats[f"q_value_{i}_starting_frame"]
+
+    if not is_explo:
+        for i, split_time in enumerate(
+                [
+                    (e - s) / 1000
+                    for s, e in zip(
+                    end_race_stats["cp_time_ms"][:-1],
+                    end_race_stats["cp_time_ms"][1:],
+                )
+                ]
+        ):
+            race_stats_to_write[f"split_{map_name}_{i}"] = split_time
+
+    return race_stats_to_write

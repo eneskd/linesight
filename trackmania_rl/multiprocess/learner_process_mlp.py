@@ -11,6 +11,7 @@ from pathlib import Path
 import numpy as np
 import torch
 from torch import multiprocessing as mp
+from multiprocessing.connection import wait
 from torch.utils.tensorboard import SummaryWriter
 
 from config_files import config_copy
@@ -257,7 +258,7 @@ def learner_process_fn(
     while True:
         # Wait for data from collector processes
         before_wait_time = time.perf_counter()
-        mp.connection.wait(rollout_queue_readers)
+        wait(rollout_queue_readers)
         time_waited = time.perf_counter() - before_wait_time
 
         if time_waited > 1:
