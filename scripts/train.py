@@ -81,7 +81,7 @@ elif getattr(config_copy, "agent_type", "iqn").lower()  == "lstm":
 else:
     from trackmania_rl.agents.iqn import make_untrained_iqn_network as make_untrained_agent
     from trackmania_rl.multiprocess.learner_process_iqn import learner_process_fn
-    from trackmania_rl.multiprocess.collector_process import collector_process_fn
+    from trackmania_rl.multiprocess.collector_process_iqn import collector_process_fn
 
 
 # noinspection PyUnresolvedReferences

@@ -637,6 +637,10 @@ def learner_process_fn(
     # Load checkpoint if available
     load_checkpoint(save_dir, online_network, target_network, optimizer, scaler, accumulated_stats, shared_steps)
 
+    # Sync shared network with loaded weights
+    with shared_network_lock:
+        uncompiled_shared_network.load_state_dict(uncompiled_online_network.state_dict())
+
     # Initialize buffer and training state
     memory_size, memory_size_start_learn = utilities.from_staircase_schedule(
         config_copy.memory_size_schedule, accumulated_stats["cumul_number_frames_played"]
