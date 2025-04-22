@@ -52,7 +52,7 @@ class MLPInferer:
 
         # Greedy action using network
         with torch.no_grad():
-            img_tensor = torch.from_numpy(img).unsqueeze(0).to("cuda", dtype=torch.float32)
+            img_tensor = (torch.from_numpy(img).unsqueeze(0).to("cuda", dtype=torch.float32) - 128.0) / 128.0
             float_tensor = torch.from_numpy(float_inputs).unsqueeze(0).to("cuda", dtype=torch.float32)
             q_values = self.network(img_tensor, float_tensor)
             action = int(torch.argmax(q_values, dim=1).item())

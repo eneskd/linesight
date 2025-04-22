@@ -22,20 +22,55 @@ from trackmania_rl import buffer_management, utilities
 from trackmania_rl.map_reference_times import reference_times
 from trackmania_rl.buffer_utilities import make_buffers, resize_buffers
 
+def dqn_loss(q_values, actions, targets, weights=None):
+    """
+    Standard DQN loss: MSE between Q(s,a) and target, with optional importance sampling weights.
 
-def setup_tensorboard(tensorboard_base_dir, layout_version="lay_mono", custom_layout=None):
-    """Setup TensorBoard with custom layout."""
-    default_layout = {
-        layout_version: {
-            "loss": ["Multiline", ["loss$", "loss_test$"]],
-            "avg_Q": ["Multiline", ["avg_Q"]],
-            "grad_norm_history": ["Multiline", ["grad_norm_history_d9", "grad_norm_history_d98"]],
-            "priorities": ["Multiline", ["priorities"]],
-        },
-    }
-    
-    layout = custom_layout if custom_layout else default_layout
-    SummaryWriter(log_dir=str(tensorboard_base_dir / layout_version)).add_custom_scalars(layout)
+    Args:
+        q_values: (batch_size, n_actions) Q-values from the network
+        actions: (batch_size,) int64 actions that were taken
+        targets: (batch_size,) float32 target values
+        weights: (batch_size,) importance sampling weights for prioritized replay
+
+    Returns:
+        Scalar loss value and TD errors for priority updates
+    """
+    q_selected = q_values.gather(1, actions.unsqueeze(1).long()).squeeze(1)
+
+    # Calculate TD error
+    td_error = q_selected - targets
+
+    # If weights are provided, apply them to the squared error
+    if weights is not None:
+        # Element-wise multiplication with weights before mean
+        return (weights * td_error.pow(2)).mean(), td_error.detach().abs()
+    else:
+        # Standard MSE loss
+        return td_error.pow(2).mean(), td_error.detach().abs()
+
+
+def save_checkpoint(save_dir, online_network, target_network, optimizer, scaler, accumulated_stats):
+    """Save checkpoint with model weights, optimizer state, and statistics."""
+    checkpoint_path = save_dir / f"checkpoint_step_{accumulated_stats['cumul_number_frames_played']}.pt"
+    try:
+        # Save consolidated checkpoint
+        torch.save({
+            'online_network': online_network.state_dict(),
+            'target_network': target_network.state_dict(),
+            'optimizer': optimizer.state_dict(),
+            'scaler': scaler.state_dict(),
+            'step': accumulated_stats['cumul_number_frames_played'],
+            'stats': accumulated_stats
+        }, checkpoint_path)
+
+        # Also save standard checkpoint files for backward compatibility
+        utilities.save_checkpoint(save_dir, online_network, target_network, optimizer, scaler, accumulated_stats)
+        print(f"Checkpoint saved at step {accumulated_stats['cumul_number_frames_played']}")
+        return True
+    except Exception as e:
+        print(f"Error saving checkpoint: {e}")
+        return False
+
 
 
 def load_checkpoint(save_dir, online_network, target_network, optimizer, scaler, accumulated_stats, shared_steps):
@@ -84,6 +119,35 @@ def load_checkpoint(save_dir, online_network, target_network, optimizer, scaler,
     return False
 
 
+
+
+def update_buffer_size(buffer, buffer_test, memory_size, new_memory_size, memory_size_start_learn,
+                    new_memory_size_start_learn, offset_cumul_number_single_memories_used):
+    """Update buffer size if needed."""
+    if new_memory_size != memory_size:
+        buffer, buffer_test = resize_buffers(buffer, buffer_test, new_memory_size)
+        offset_adjustment = (
+                                    new_memory_size_start_learn - memory_size_start_learn) * config_copy.number_times_single_memory_is_used_before_discard
+        offset_cumul_number_single_memories_used += offset_adjustment
+        return buffer, buffer_test, new_memory_size, new_memory_size_start_learn, offset_cumul_number_single_memories_used
+    return buffer, buffer_test, memory_size, memory_size_start_learn, offset_cumul_number_single_memories_used
+
+
+def update_optimizer_params(optimizer, learning_rate, buffer):
+    """Update optimizer parameters and buffer settings."""
+    for param_group in optimizer.param_groups:
+        param_group["lr"] = learning_rate
+        param_group["epsilon"] = config_copy.adam_epsilon
+        param_group["betas"] = (config_copy.adam_beta1, config_copy.adam_beta2)
+
+    # Update prioritized sampler parameters if applicable
+    if isinstance(buffer._sampler, PrioritizedSampler):
+        buffer._sampler._alpha = config_copy.prio_alpha
+        buffer._sampler._beta = config_copy.prio_beta
+        buffer._sampler._eps = config_copy.prio_epsilon
+
+
+
 def get_rollout_from_queues(rollout_queues, queue_check_order, step=None):
     """Get rollout data from worker queues."""
     for idx in queue_check_order:
@@ -114,32 +178,6 @@ def get_rollout_from_queues(rollout_queues, queue_check_order, step=None):
             return rollout_data, idx
 
     return None, -1
-
-
-def update_buffer_size(buffer, buffer_test, memory_size, new_memory_size, memory_size_start_learn,
-                    new_memory_size_start_learn, offset_cumul_number_single_memories_used):
-    """Update buffer size if needed."""
-    if new_memory_size != memory_size:
-        buffer, buffer_test = resize_buffers(buffer, buffer_test, new_memory_size)
-        offset_adjustment = (
-                                    new_memory_size_start_learn - memory_size_start_learn) * config_copy.number_times_single_memory_is_used_before_discard
-        offset_cumul_number_single_memories_used += offset_adjustment
-        return buffer, buffer_test, new_memory_size, new_memory_size_start_learn, offset_cumul_number_single_memories_used
-    return buffer, buffer_test, memory_size, memory_size_start_learn, offset_cumul_number_single_memories_used
-
-
-def update_optimizer_params(optimizer, learning_rate, buffer):
-    """Update optimizer parameters and buffer settings."""
-    for param_group in optimizer.param_groups:
-        param_group["lr"] = learning_rate
-        param_group["epsilon"] = config_copy.adam_epsilon
-        param_group["betas"] = (config_copy.adam_beta1, config_copy.adam_beta2)
-
-    # Update prioritized sampler parameters if applicable
-    if isinstance(buffer._sampler, PrioritizedSampler):
-        buffer._sampler._alpha = config_copy.prio_alpha
-        buffer._sampler._beta = config_copy.prio_beta
-        buffer._sampler._eps = config_copy.prio_epsilon
 
 
 def process_rollout(rollout_results, buffer, buffer_test, gamma, accumulated_stats, engineered_rewards=None):
@@ -269,6 +307,66 @@ def log_training_step(step, stats, buffer_size):
     print(f"    First 5 rewards: {stats['rewards'][:5].cpu().numpy().tolist() if 'rewards' in stats else None}")
 
 
+def update_target_network(target_network, online_network, accumulated_stats):
+    """Update target network if conditions are met."""
+    if (accumulated_stats["cumul_number_single_memories_used"]
+            >= accumulated_stats.get("cumul_number_single_memories_used_next_target_network_update", 0)):
+        accumulated_stats["cumul_number_target_network_updates"] = accumulated_stats.get(
+            "cumul_number_target_network_updates", 0) + 1
+        accumulated_stats["cumul_number_single_memories_used_next_target_network_update"] = (
+                accumulated_stats.get("cumul_number_single_memories_used_next_target_network_update", 0) +
+                config_copy.number_memories_trained_on_between_target_network_updates
+        )
+        utilities.soft_copy_param(target_network, online_network, config_copy.soft_update_tau)
+        return True
+    return False
+
+
+
+
+
+
+def save_good_runs(base_dir, save_dir, rollout_results, end_race_stats, map_name, is_explo, accumulated_stats):
+    """Save good runs based on race time."""
+    if end_race_stats["race_time"] < accumulated_stats["alltime_min_ms"].get(map_name, 99999999999):
+        # This is a new alltime_minimum
+        accumulated_stats["alltime_min_ms"][map_name] = end_race_stats["race_time"]
+        if accumulated_stats["cumul_number_frames_played"] > config_copy.frames_before_save_best_runs:
+            name = f"{map_name}_{end_race_stats['race_time']}"
+            utilities.save_run(
+                base_dir,
+                save_dir / "best_runs" / name,
+                rollout_results,
+                f"{name}.inputs",
+                inputs_only=False,
+            )
+
+    if end_race_stats["race_time"] < config_copy.threshold_to_save_all_runs_ms:
+        name = f"{map_name}_{end_race_stats['race_time']}_{datetime.now().strftime('%m%d_%H%M%S')}_{accumulated_stats['cumul_number_frames_played']}_{'explo' if is_explo else 'eval'}"
+        utilities.save_run(
+            base_dir,
+            save_dir / "good_runs",
+            rollout_results,
+            f"{name}.inputs",
+            inputs_only=True,
+        )
+
+
+def setup_tensorboard(tensorboard_base_dir, layout_version="lay_mono", custom_layout=None):
+    """Setup TensorBoard with custom layout."""
+    default_layout = {
+        layout_version: {
+            "loss": ["Multiline", ["loss$", "loss_test$"]],
+            "avg_Q": ["Multiline", ["avg_Q"]],
+            "grad_norm_history": ["Multiline", ["grad_norm_history_d9", "grad_norm_history_d98"]],
+            "priorities": ["Multiline", ["priorities"]],
+        },
+    }
+
+    layout = custom_layout if custom_layout else default_layout
+    SummaryWriter(log_dir=str(tensorboard_base_dir / layout_version)).add_custom_scalars(layout)
+
+
 def log_to_tensorboard(tensorboard_writer, step, stats, buffer_size, max_next_q_mean, train_duration_ms,
                     end_race_stats=None, rolling_means=None):
     """Log training metrics to TensorBoard."""
@@ -295,132 +393,21 @@ def log_to_tensorboard(tensorboard_writer, step, stats, buffer_size, max_next_q_
                 print(f"    End race stat: {k} = {v}")
 
 
-def log_detailed_tensorboard_stats(tensorboard_writer, online_network, optimizer, accumulated_stats, step_stats,
-                                previous_alltime_min, frame_count):
-    """Log detailed statistics to TensorBoard periodically."""
-    walltime_tb = time.time()
-
-    # Log layer L2 norms
-    for name, param in online_network.named_parameters():
-        tensorboard_writer.add_scalar(
-            tag=f"layer_{name}_L2",
-            scalar_value=np.sqrt((param ** 2).mean().detach().cpu().item()),
-            global_step=frame_count,
-            walltime=walltime_tb,
-        )
-
-    # Log optimizer state
-    try:
-        assert len(optimizer.param_groups) == 1
-        for p, (name, _) in zip(
-                optimizer.param_groups[0]["params"],
-                online_network.named_parameters(),
-        ):
-            state = optimizer.state[p]
-            exp_avg, exp_avg_sq = state["exp_avg"], state["exp_avg_sq"]
-            mod_lr = 1 / (exp_avg_sq.sqrt() + 1e-4)
-            tensorboard_writer.add_scalar(
-                tag=f"lr_ratio_{name}_L2",
-                scalar_value=np.sqrt((mod_lr ** 2).mean().detach().cpu().item()),
-                global_step=frame_count,
-                walltime=walltime_tb,
-            )
-            tensorboard_writer.add_scalar(
-                tag=f"exp_avg_{name}_L2",
-                scalar_value=np.sqrt((exp_avg ** 2).mean().detach().cpu().item()),
-                global_step=frame_count,
-                walltime=walltime_tb,
-            )
-            tensorboard_writer.add_scalar(
-                tag=f"exp_avg_sq_{name}_L2",
-                scalar_value=np.sqrt((exp_avg_sq ** 2).mean().detach().cpu().item()),
-                global_step=frame_count,
-                walltime=walltime_tb,
-            )
-    except Exception:
-        pass
-
-    # Log all stats
-    for k, v in step_stats.items():
-        tensorboard_writer.add_scalar(
-            tag=k,
-            scalar_value=v,
-            global_step=frame_count,
-            walltime=walltime_tb,
-        )
-
-    # Log time summary comparison with previous mins
-    previous_alltime_min = previous_alltime_min or copy.deepcopy(accumulated_stats["alltime_min_ms"])
-
-    times_summary = f"{datetime.now().strftime('%Y/%m/%d, %H:%M:%S')} " + " ".join(
-        [
-            f"{'**' if v < previous_alltime_min.get(k, 99999999) else ''}{k}: {v / 1000:.2f}{'**' if v < previous_alltime_min.get(k, 99999999) else ''}"
-            for k, v in accumulated_stats["alltime_min_ms"].items()
-        ]
-    )
-
-    tensorboard_writer.add_text(
-        "times_summary",
-        times_summary,
-        global_step=frame_count,
-        walltime=walltime_tb,
-    )
-
-    return copy.deepcopy(accumulated_stats["alltime_min_ms"])
-
-
-def save_checkpoint(save_dir, online_network, target_network, optimizer, scaler, accumulated_stats):
-    """Save checkpoint with model weights, optimizer state, and statistics."""
-    checkpoint_path = save_dir / f"checkpoint_step_{accumulated_stats['cumul_number_frames_played']}.pt"
-    try:
-        # Save consolidated checkpoint
-        torch.save({
-            'online_network': online_network.state_dict(),
-            'target_network': target_network.state_dict(),
-            'optimizer': optimizer.state_dict(),
-            'scaler': scaler.state_dict(),
-            'step': accumulated_stats['cumul_number_frames_played'],
-            'stats': accumulated_stats
-        }, checkpoint_path)
-
-        # Also save standard checkpoint files for backward compatibility
-        utilities.save_checkpoint(save_dir, online_network, target_network, optimizer, scaler, accumulated_stats)
-        print(f"Checkpoint saved at step {accumulated_stats['cumul_number_frames_played']}")
-        return True
-    except Exception as e:
-        print(f"Error saving checkpoint: {e}")
-        return False
-
-
-def update_target_network(target_network, online_network, accumulated_stats):
-    """Update target network if conditions are met."""
-    if (accumulated_stats["cumul_number_single_memories_used"]
-            >= accumulated_stats.get("cumul_number_single_memories_used_next_target_network_update", 0)):
-        accumulated_stats["cumul_number_target_network_updates"] = accumulated_stats.get(
-            "cumul_number_target_network_updates", 0) + 1
-        accumulated_stats["cumul_number_single_memories_used_next_target_network_update"] = (
-                accumulated_stats.get("cumul_number_single_memories_used_next_target_network_update", 0) +
-                config_copy.number_memories_trained_on_between_target_network_updates
-        )
-        utilities.soft_copy_param(target_network, online_network, config_copy.soft_update_tau)
-        return True
-    return False
-
-
 def collect_periodic_stats(accumulated_stats, loss_history, train_on_batch_duration_history, grad_norm_history,
-                        layer_grad_norm_history, buffer, training_params, 
-                        time_waited_for_workers, time_training, time_testing, time_since_last_save,
-                        transitions_learned_last_save):
+                           layer_grad_norm_history, buffer, training_params,
+                           time_waited_for_workers, time_training, time_testing, time_since_last_save,
+                           transitions_learned_last_save):
     """Collect statistics for periodic reporting and saving."""
     gamma = training_params.get("gamma", 0.99)
     learning_rate = training_params.get("learning_rate", 0.001)
     weight_decay = training_params.get("weight_decay", 0.0)
     epsilon = training_params.get("epsilon", 0.0)
     epsilon_boltzmann = training_params.get("epsilon_boltzmann", 0.0)
-    
+
     transitions_learned_per_second = (
-            accumulated_stats["cumul_number_single_memories_used"] - transitions_learned_last_save
-        ) / time_since_last_save
+                                             accumulated_stats[
+                                                 "cumul_number_single_memories_used"] - transitions_learned_last_save
+                                     ) / time_since_last_save
 
     waited_percentage = time_waited_for_workers / time_since_last_save
     trained_percentage = time_training / time_since_last_save
@@ -439,7 +426,7 @@ def collect_periodic_stats(accumulated_stats, loss_history, train_on_batch_durat
         "learner_percentage_testing": tested_percentage,
         "transitions_learned_per_second": transitions_learned_per_second,
     }
-    
+
     # Add exploration parameters if available
     if epsilon is not None:
         step_stats["epsilon"] = epsilon
@@ -499,72 +486,6 @@ def collect_periodic_stats(accumulated_stats, loss_history, train_on_batch_durat
         step_stats[f"alltime_min_ms_{key}"] = value
 
     return step_stats
-
-
-def dqn_loss(q_values, actions, targets, weights=None):
-    """
-    Standard DQN loss: MSE between Q(s,a) and target, with optional importance sampling weights.
-
-    Args:
-        q_values: (batch_size, n_actions) Q-values from the network
-        actions: (batch_size,) int64 actions that were taken
-        targets: (batch_size,) float32 target values
-        weights: (batch_size,) importance sampling weights for prioritized replay
-
-    Returns:
-        Scalar loss value and TD errors for priority updates
-    """
-    q_selected = q_values.gather(1, actions.unsqueeze(1).long()).squeeze(1)
-
-    # Calculate TD error
-    td_error = q_selected - targets
-
-    # If weights are provided, apply them to the squared error
-    if weights is not None:
-        # Element-wise multiplication with weights before mean
-        return (weights * td_error.pow(2)).mean(), td_error.detach().abs()
-    else:
-        # Standard MSE loss
-        return td_error.pow(2).mean(), td_error.detach().abs()
-
-
-def save_good_runs(base_dir, save_dir, rollout_results, end_race_stats, map_name, is_explo, accumulated_stats):
-    """Save good runs based on race time."""
-    if end_race_stats["race_time"] < accumulated_stats["alltime_min_ms"].get(map_name, 99999999999):
-        # This is a new alltime_minimum
-        accumulated_stats["alltime_min_ms"][map_name] = end_race_stats["race_time"]
-        if accumulated_stats["cumul_number_frames_played"] > config_copy.frames_before_save_best_runs:
-            name = f"{map_name}_{end_race_stats['race_time']}"
-            utilities.save_run(
-                base_dir,
-                save_dir / "best_runs" / name,
-                rollout_results,
-                f"{name}.inputs",
-                inputs_only=False,
-            )
-
-    if end_race_stats["race_time"] < config_copy.threshold_to_save_all_runs_ms:
-        name = f"{map_name}_{end_race_stats['race_time']}_{datetime.now().strftime('%m%d_%H%M%S')}_{accumulated_stats['cumul_number_frames_played']}_{'explo' if is_explo else 'eval'}"
-        utilities.save_run(
-            base_dir,
-            save_dir / "good_runs",
-            rollout_results,
-            f"{name}.inputs",
-            inputs_only=True,
-        )
-
-
-
-def log_race_stats_to_tensorboard(tensorboard_writer, race_stats_to_write, accumulated_stats):
-    """Log race statistics to TensorBoard."""
-    walltime_tb = time.time()
-    for tag, value in race_stats_to_write.items():
-        tensorboard_writer.add_scalar(
-            tag=tag,
-            scalar_value=value,
-            global_step=accumulated_stats["cumul_number_frames_played"],
-            walltime=walltime_tb,
-        )
 
 
 def collect_race_stats(rollout_results, end_race_stats, is_explo, map_name, map_status, rollout_duration,
@@ -647,3 +568,90 @@ def collect_race_stats(rollout_results, end_race_stats, is_explo, map_name, map_
             race_stats_to_write[f"split_{map_name}_{i}"] = split_time
 
     return race_stats_to_write
+
+
+def log_race_stats_to_tensorboard(tensorboard_writer, race_stats_to_write, accumulated_stats):
+    """Log race statistics to TensorBoard."""
+    walltime_tb = time.time()
+    for tag, value in race_stats_to_write.items():
+        tensorboard_writer.add_scalar(
+            tag=tag,
+            scalar_value=value,
+            global_step=accumulated_stats["cumul_number_frames_played"],
+            walltime=walltime_tb,
+        )
+
+def log_detailed_tensorboard_stats(tensorboard_writer, online_network, optimizer, accumulated_stats, step_stats,
+                                previous_alltime_min, frame_count):
+    """Log detailed statistics to TensorBoard periodically."""
+    walltime_tb = time.time()
+
+    # Log layer L2 norms
+    for name, param in online_network.named_parameters():
+        tensorboard_writer.add_scalar(
+            tag=f"layer_{name}_L2",
+            scalar_value=np.sqrt((param ** 2).mean().detach().cpu().item()),
+            global_step=frame_count,
+            walltime=walltime_tb,
+        )
+
+    # Log optimizer state
+    try:
+        assert len(optimizer.param_groups) == 1
+        for p, (name, _) in zip(
+                optimizer.param_groups[0]["params"],
+                online_network.named_parameters(),
+        ):
+            state = optimizer.state[p]
+            exp_avg, exp_avg_sq = state["exp_avg"], state["exp_avg_sq"]
+            mod_lr = 1 / (exp_avg_sq.sqrt() + 1e-4)
+            tensorboard_writer.add_scalar(
+                tag=f"lr_ratio_{name}_L2",
+                scalar_value=np.sqrt((mod_lr ** 2).mean().detach().cpu().item()),
+                global_step=frame_count,
+                walltime=walltime_tb,
+            )
+            tensorboard_writer.add_scalar(
+                tag=f"exp_avg_{name}_L2",
+                scalar_value=np.sqrt((exp_avg ** 2).mean().detach().cpu().item()),
+                global_step=frame_count,
+                walltime=walltime_tb,
+            )
+            tensorboard_writer.add_scalar(
+                tag=f"exp_avg_sq_{name}_L2",
+                scalar_value=np.sqrt((exp_avg_sq ** 2).mean().detach().cpu().item()),
+                global_step=frame_count,
+                walltime=walltime_tb,
+            )
+    except Exception:
+        pass
+
+    # Log all stats
+    for k, v in step_stats.items():
+        tensorboard_writer.add_scalar(
+            tag=k,
+            scalar_value=v,
+            global_step=frame_count,
+            walltime=walltime_tb,
+        )
+
+    # Log time summary comparison with previous mins
+    previous_alltime_min = previous_alltime_min or copy.deepcopy(accumulated_stats["alltime_min_ms"])
+
+    times_summary = f"{datetime.now().strftime('%Y/%m/%d, %H:%M:%S')} " + " ".join(
+        [
+            f"{'**' if v < previous_alltime_min.get(k, 99999999) else ''}{k}: {v / 1000:.2f}{'**' if v < previous_alltime_min.get(k, 99999999) else ''}"
+            for k, v in accumulated_stats["alltime_min_ms"].items()
+        ]
+    )
+
+    tensorboard_writer.add_text(
+        "times_summary",
+        times_summary,
+        global_step=frame_count,
+        walltime=walltime_tb,
+    )
+
+    return copy.deepcopy(accumulated_stats["alltime_min_ms"])
+
+

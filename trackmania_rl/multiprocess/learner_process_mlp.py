@@ -32,6 +32,9 @@ from trackmania_rl.multiprocess.learner_process_utils import (
     save_checkpoint,
     update_target_network,
     collect_periodic_stats,
+    collect_race_stats,
+    log_race_stats_to_tensorboard,
+    save_good_runs,
     dqn_loss
 )
 
@@ -315,6 +318,15 @@ def learner_process_fn(
         if rollout_data:
             accumulated_stats["cumul_number_frames_played"] += len(rollout_results["frames"])
             shared_steps.value = accumulated_stats["cumul_number_frames_played"]
+
+            # Collect and log race statistics
+            race_stats = collect_race_stats(rollout_results, end_race_stats, is_explo, map_name, map_status,
+                                            rollout_duration, accumulated_stats)
+            log_race_stats_to_tensorboard(tensorboard_writer, race_stats, accumulated_stats)
+
+            # Save good runs
+            save_good_runs(base_dir, save_dir, rollout_results, end_race_stats, map_name, is_explo,
+                           accumulated_stats)
 
             # Process rollout data and fill buffer
             if fill_buffer:
