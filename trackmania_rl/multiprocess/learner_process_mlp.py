@@ -19,23 +19,28 @@ from trackmania_rl import utilities
 from trackmania_rl.agents.mlp import make_untrained_mlp_agent
 from trackmania_rl.buffer_utilities import make_buffers
 from trackmania_rl.multiprocess.learner_process_utils import (
-    setup_tensorboard,
     load_checkpoint,
     get_rollout_from_queues,
     update_buffer_size,
     update_optimizer_params,
     process_rollout,
     sample_batch_from_buffer,
-    log_training_step,
-    log_to_tensorboard,
-    log_detailed_tensorboard_stats,
     save_checkpoint,
     update_target_network,
-    collect_periodic_stats,
-    collect_race_stats,
-    log_race_stats_to_tensorboard,
     save_good_runs,
     dqn_loss
+)
+
+
+from trackmania_rl.tensorboard_logging_utils import (
+    setup_tensorboard,
+    get_tensorboard_writer,
+    log_training_step,
+    log_training_step_to_tensorboard,
+    log_race_stats_to_tensorboard,
+    log_detailed_tensorboard_stats,
+    collect_periodic_stats,
+    collect_race_stats
 )
 
 
@@ -238,8 +243,10 @@ def learner_process_fn(
         config_copy.tensorboard_suffix_schedule,
         accumulated_stats.get("cumul_number_frames_played", 0),
     )
-    tensorboard_writer = SummaryWriter(
-        log_dir=str(tensorboard_base_dir / (config_copy.run_name + '_' + config_copy.agent_type + tensorboard_suffix))
+    tensorboard_writer = get_tensorboard_writer(
+        tensorboard_base_dir,
+        config_copy,
+        tensorboard_suffix
     )
 
     # Initialize tracking histories
@@ -256,7 +263,9 @@ def learner_process_fn(
     # ========================================================
     # Training loop
     # ========================================================
-    step = 0
+    # Load step from accumulated_stats if available, otherwise start from 0
+    step = accumulated_stats.get("training_step", 0)
+    print(f"Starting training from step {step}")
 
     while True:
         # Wait for data from collector processes
@@ -292,11 +301,13 @@ def learner_process_fn(
         )
 
         # Update tensorboard writer if suffix changed
+        # New refresh when suffix changes:
         if config_values["tensorboard_suffix"] != tensorboard_suffix:
             tensorboard_suffix = config_values["tensorboard_suffix"]
-            tensorboard_writer = SummaryWriter(
-                log_dir=str(
-                    tensorboard_base_dir / (config_copy.run_name + '_' + config_copy.agent_type + tensorboard_suffix))
+            tensorboard_writer = get_tensorboard_writer(
+                tensorboard_base_dir,
+                config_copy,
+                tensorboard_suffix
             )
 
         # Update buffer size if needed
@@ -423,14 +434,13 @@ def learner_process_fn(
             update_target_network(target_network, online_network, accumulated_stats)
 
             # Log to TensorBoard
-            log_to_tensorboard(
+            log_training_step_to_tensorboard(
                 tensorboard_writer,
                 step,
                 stats,
                 len(buffer),
                 stats["max_next_q"],
-                train_duration_ms,
-                end_race_stats if rollout_data else None,
+                train_duration_ms * 1000,
                 accumulated_stats["rolling_mean_ms"]
             )
 
@@ -445,7 +455,8 @@ def learner_process_fn(
                     accumulated_stats["cumul_number_single_memories_should_have_been_used"]
             )
 
-        # Save to files
+        # Save to files - now include the step counter
+        accumulated_stats["training_step"] = step
         utilities.save_checkpoint(save_dir, online_network, target_network, optimizer, scaler, accumulated_stats)
 
         # ===============================================
@@ -501,5 +512,6 @@ def learner_process_fn(
             grad_norm_history = []
             layer_grad_norm_history = defaultdict(list)
 
-            # Save checkpoint
+            # Save checkpoint - now include the step counter
+            accumulated_stats["training_step"] = step
             save_checkpoint(save_dir, online_network, target_network, optimizer, scaler, accumulated_stats)

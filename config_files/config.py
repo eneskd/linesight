@@ -28,10 +28,10 @@ from config_files.user_config import *
 W_downsized = 160
 H_downsized = 120
 
-run_name = "mlp_test_004"
+run_name = "iqn_test_005"
 running_speed = 80
 
-agent_type = "mlp"  # "mlp", "iqn", "lstm"
+agent_type = "iqn"  # "mlp", "iqn", "lstm"
 
 
 

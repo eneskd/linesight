@@ -36,19 +36,27 @@ from trackmania_rl.analysis_metrics import (
 from trackmania_rl.buffer_utilities import make_buffers, resize_buffers
 from trackmania_rl.map_reference_times import reference_times
 from trackmania_rl.multiprocess.learner_process_utils import (
-    setup_tensorboard,
     load_checkpoint,
     get_rollout_from_queues,
     update_buffer_size,
-    log_training_step,
-    log_to_tensorboard,
-    collect_race_stats,
-    log_race_stats_to_tensorboard,
-    log_detailed_tensorboard_stats,
     save_checkpoint,
     update_target_network,
     save_good_runs,
 )
+
+
+from trackmania_rl.tensorboard_logging_utils import (
+    setup_tensorboard,
+    get_tensorboard_writer,
+    log_training_step,
+    log_training_step_to_tensorboard,
+    log_race_stats_to_tensorboard,
+    log_detailed_tensorboard_stats,
+    log_iqn_specific_stats,
+    collect_periodic_stats_iqn,
+    collect_race_stats
+)
+
 
 
 def update_optimizer_params(optimizer, params, buffer):
@@ -165,91 +173,6 @@ def update_config_parameters(accumulated_stats):
 
 
 
-def collect_periodic_stats_iqn(accumulated_stats, loss_history, train_on_batch_duration_history, grad_norm_history,
-                               layer_grad_norm_history, buffer, gamma, learning_rate, weight_decay,
-                               time_waited_for_workers, time_training, time_testing, time_since_last_save,
-                               transitions_learned_last_save, epsilon, epsilon_boltzmann):
-    """Collect statistics for periodic reporting and saving."""
-    transitions_learned_per_second = (
-                                             accumulated_stats[
-                                                 "cumul_number_single_memories_used"] - transitions_learned_last_save
-                                     ) / time_since_last_save
-
-    waited_percentage = time_waited_for_workers / time_since_last_save
-    trained_percentage = time_training / time_since_last_save
-    tested_percentage = time_testing / time_since_last_save
-
-    # Basic statistics
-    step_stats = {
-        "gamma": gamma,
-        "n_steps": config_copy.n_steps,
-        "epsilon": epsilon,
-        "epsilon_boltzmann": epsilon_boltzmann,
-        "tau_epsilon_boltzmann": config_copy.tau_epsilon_boltzmann,
-        "learning_rate": learning_rate,
-        "weight_decay": weight_decay,
-        "discard_non_greedy_actions_in_nsteps": config_copy.discard_non_greedy_actions_in_nsteps,
-        "memory_size": len(buffer),
-        "number_times_single_memory_is_used_before_discard": config_copy.number_times_single_memory_is_used_before_discard,
-        "learner_percentage_waiting_for_workers": waited_percentage,
-        "learner_percentage_training": trained_percentage,
-        "learner_percentage_testing": tested_percentage,
-        "transitions_learned_per_second": transitions_learned_per_second,
-    }
-
-    # Loss and gradient statistics
-    if len(loss_history) > 0:
-        step_stats.update({
-            "loss": np.mean(loss_history),
-            "train_on_batch_duration": np.median(train_on_batch_duration_history),
-            "grad_norm_history_q1": np.quantile(grad_norm_history, 0.25),
-            "grad_norm_history_median": np.quantile(grad_norm_history, 0.5),
-            "grad_norm_history_q3": np.quantile(grad_norm_history, 0.75),
-            "grad_norm_history_d9": np.quantile(grad_norm_history, 0.9),
-            "grad_norm_history_d98": np.quantile(grad_norm_history, 0.98),
-            "grad_norm_history_max": np.max(grad_norm_history),
-        })
-
-        # Layer-specific gradient statistics
-        for key, val in layer_grad_norm_history.items():
-            if len(val) > 0:
-                step_stats.update({
-                    f"{key}_median": np.quantile(val, 0.5),
-                    f"{key}_q3": np.quantile(val, 0.75),
-                    f"{key}_d9": np.quantile(val, 0.9),
-                    f"{key}_c98": np.quantile(val, 0.98),
-                    f"{key}_max": np.max(val),
-                })
-
-    # Prioritized replay statistics
-    if isinstance(buffer._sampler, PrioritizedSampler):
-        try:
-            all_priorities = np.array([buffer._sampler._sum_tree.at(i) for i in range(len(buffer))])
-            step_stats.update({
-                "priorities_min": np.min(all_priorities),
-                "priorities_q1": np.quantile(all_priorities, 0.1),
-                "priorities_mean": np.mean(all_priorities),
-                "priorities_median": np.quantile(all_priorities, 0.5),
-                "priorities_q3": np.quantile(all_priorities, 0.75),
-                "priorities_d9": np.quantile(all_priorities, 0.9),
-                "priorities_c98": np.quantile(all_priorities, 0.98),
-                "priorities_max": np.max(all_priorities),
-            })
-        except Exception as e:
-            print(f"Error collecting priority statistics: {e}")
-
-    # Add accumulated stats except for complex nested objects
-    for key, value in accumulated_stats.items():
-        if key not in ["alltime_min_ms", "rolling_mean_ms"]:
-            step_stats[key] = value
-
-    # Add minimum times
-    for key, value in accumulated_stats["alltime_min_ms"].items():
-        step_stats[f"alltime_min_ms_{key}"] = value
-
-    return step_stats
-
-
 
 
 
@@ -315,11 +238,12 @@ def learner_process_fn(
     single_reset_flag = config_copy.single_reset_flag
 
     # Setup tensorboard
-    tensorboard_suffix = utilities.from_staircase_schedule(
-        config_copy.tensorboard_suffix_schedule, accumulated_stats["cumul_number_frames_played"]
-    )
-    tensorboard_writer = SummaryWriter(
-        log_dir=str(tensorboard_base_dir / (config_copy.run_name + '_' + config_copy.agent_type + tensorboard_suffix))
+    params = update_config_parameters(accumulated_stats)
+    tensorboard_suffix = params["tensorboard_suffix"]
+    tensorboard_writer = get_tensorboard_writer(
+        tensorboard_base_dir,
+        config_copy,
+        tensorboard_suffix
     )
 
     # Initialize history trackers
@@ -344,6 +268,9 @@ def learner_process_fn(
         iqn_k=iqn_config_copy.iqn_k,
         tau_epsilon_boltzmann=config_copy.tau_epsilon_boltzmann,
     )
+
+    step = accumulated_stats.get("training_step", 0)
+    print(f"Starting training from step {step}")
 
     # Main training loop
     while True:
@@ -381,11 +308,15 @@ def learner_process_fn(
             config_copy.tensorboard_suffix_schedule,
             accumulated_stats["cumul_number_frames_played"],
         )
+
+        # Update tensorboard writer if suffix changed
+        # New refresh when suffix changes:
         if new_tensorboard_suffix != tensorboard_suffix:
             tensorboard_suffix = new_tensorboard_suffix
-            tensorboard_writer = SummaryWriter(
-                log_dir=str(
-                    tensorboard_base_dir / (config_copy.run_name + '_' + config_copy.agent_type + tensorboard_suffix))
+            tensorboard_writer = get_tensorboard_writer(
+                tensorboard_base_dir,
+                config_copy,
+                tensorboard_suffix
             )
 
         # Update buffer size if needed
@@ -502,10 +433,13 @@ def learner_process_fn(
                 else:
                     # Train on main buffer
                     train_start_time = time.perf_counter()
-                    loss, grad_norm = trainer.train_on_batch(buffer, do_learn=True)
+                    stats = trainer.train_on_batch(buffer, do_learn=True)
                     train_duration = time.perf_counter() - train_start_time
                     train_on_batch_duration_history.append(train_duration)
                     time_training_since_last_tensorboard_write += train_duration
+
+                    grad_norm = stats["grad_norm"]
+                    loss = stats["loss"]
 
                     # Update memory usage counters
                     batch_size_multiplier = 4 if (
@@ -518,11 +452,22 @@ def learner_process_fn(
                     if not math.isinf(grad_norm):
                         grad_norm_history.append(grad_norm)
 
+                    log_training_step(step, {"loss": loss, "grad_norm": grad_norm}, len(buffer))
                     accumulated_stats["cumul_number_batches_done"] += 1
-                    print(f"B    {loss=:<8.2e} {grad_norm=:<8.2e} {train_duration * 1000:<8.1f}")
 
+                    step += 1  # Increment the step counter
                     # Apply weight decay
                     utilities.custom_weight_decay(online_network, 1 - params["weight_decay"])
+
+                    log_training_step_to_tensorboard(
+                        tensorboard_writer,
+                        step,
+                        stats,
+                        len(buffer),
+                        stats["max_next_q"],
+                        train_duration * 1000,  # Convert to milliseconds
+                        accumulated_stats["rolling_mean_ms"]
+                    )
 
                     # Update shared network periodically
                     if accumulated_stats[
@@ -543,6 +488,7 @@ def learner_process_fn(
             sys.stdout.flush()
 
         # Periodically save checkpoint and log statistics
+        accumulated_stats["training_step"] = step
         utilities.save_checkpoint(save_dir, online_network, target_network, optimizer, scaler, accumulated_stats)
 
         save_frequency_s = config_copy.save_frequency_s
@@ -589,9 +535,14 @@ def learner_process_fn(
             # Collect IQN spread statistics
             if online_network.training:
                 online_network.eval()
+
+
             tau = torch.linspace(0.05, 0.95, iqn_config_copy.iqn_k)[:, None].to("cuda")
             per_quantile_output = inferer.infer_network(rollout_results["frames"][0], rollout_results["state_float"][0],
                                                         tau)
+
+            log_iqn_specific_stats(tensorboard_writer, per_quantile_output, step)
+
             for i, std in enumerate(list(per_quantile_output.std(axis=0))):
                 step_stats[f"std_within_iqn_quantiles_for_action{i}"] = std
 
@@ -603,7 +554,7 @@ def learner_process_fn(
                 accumulated_stats,
                 step_stats,
                 previous_alltime_min,
-                accumulated_stats["cumul_number_frames_played"]
+                step
             )
 
             # Log buffer statistics
@@ -630,4 +581,5 @@ def learner_process_fn(
                 highest_prio_transitions(buffer, save_dir)
 
             # Save checkpoint
+            accumulated_stats["training_step"] = step
             save_checkpoint(save_dir, online_network, target_network, optimizer, scaler, accumulated_stats)

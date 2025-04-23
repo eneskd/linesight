@@ -345,6 +345,28 @@ class Trainer:
                     .cpu()
                     .type(torch.float64),
                 )
+
+            if do_learn:
+                stats = {
+                    "loss": total_loss,
+                    "grad_norm": grad_norm,
+                    "mean_q": q__st__online__quantiles_tau3.mean().detach().cpu().item(),
+                    "max_q": q__st__online__quantiles_tau3.max().detach().cpu().item(),
+                    "min_q": q__st__online__quantiles_tau3.min().detach().cpu().item(),
+                    "max_next_q": q__stpo__target__quantiles_tau2.max().detach().cpu().item(),
+                    "reward_mean": rewards.mean().detach().cpu().item(),
+                    "reward_min": rewards.min().detach().cpu().item(),
+                    "reward_max": rewards.max().detach().cpu().item(),
+                    "reward_std": rewards.std().detach().cpu().item(),
+                    # IQN-specific metrics
+                    "quantile_huber_loss": loss.mean().detach().cpu().item(),
+                    "tau_mean": tau3.mean().detach().cpu().item(),
+                    "tau_std": tau3.std().detach().cpu().item(),
+                    "tau_min": tau3.min().detach().cpu().item(),
+                    "tau_max": tau3.max().detach().cpu().item(),
+                }
+                return stats
+
         return total_loss, grad_norm
 
 
