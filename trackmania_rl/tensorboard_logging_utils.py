@@ -9,6 +9,7 @@ import time
 from pathlib import Path
 from typing import Dict, List, Optional, Any, Union, Tuple
 
+import mpmath
 import numpy as np
 import numpy.typing as npt
 import torch
@@ -104,7 +105,7 @@ def log_training_step_to_tensorboard(
         writer.add_scalar("rewards/std", stats["reward_std"], step)
 
 
-    if "quantile_huber_loss" in stats:
+    if "quantile_huber_loss" in stats and not math.isinf(stats["loss"]):
         writer.add_scalar("iqn/quantile_huber_loss", stats["quantile_huber_loss"], step)
     if "tau_mean" in stats:
         writer.add_scalar("iqn/tau_mean", stats["tau_mean"], step)
@@ -184,7 +185,10 @@ def log_race_stats_to_tensorboard(
         tag = key
 
         # Determine the appropriate category based on key patterns
-        if "race_time" in key:
+        if key.startswith("instrumentation__"):
+            category = "instrumentation"
+            tag = key.replace("instrumentation__", "")
+        elif "race_time" in key:
             category = "race_times"
         elif "ratio" in key:
             category = "completion_ratios"
@@ -196,9 +200,6 @@ def log_race_stats_to_tensorboard(
             category = "q_values"
         elif "split_" in key:
             category = "splits"
-        elif key.startswith("instrumentation__"):
-            category = "instrumentation"
-            tag = key.replace("instrumentation__", "")
         elif "worker_time" in key:
             category = "performance"
         else:
@@ -265,14 +266,15 @@ def log_detailed_tensorboard_stats(
     # Log hyperparameters
     for key, value in step_stats.items():
         if isinstance(value, (int, float)) and not isinstance(value, bool):
-            writer.add_scalar(f"hyperparams/{key}", value, current_step)
+            if not mpmath.isinf(value):
+                writer.add_scalar(f"hyperparams/{key}", value, current_step)
     
     # Log model parameters
     for name, param in online_network.named_parameters():
         if param.requires_grad:
             writer.add_histogram(f"model/{name}", param.data, current_step)
             if param.grad is not None:
-                writer.add_histogram(f"grad/{name}", param.grad, current_step)
+                writer.add_histogram(f"model/grad/{name}", param.grad, current_step)
     
     # Log optimizer state
     for i, param_group in enumerate(optimizer.param_groups):
@@ -354,7 +356,7 @@ def collect_race_stats(
         f"explo_race_time_{map_status}_{map_name}" if is_explo else f"eval_race_time_{map_status}_{map_name}" :
             end_race_stats["race_time"]/ 1000,
         f"explo_race_finished_{map_status}_{map_name}" if is_explo else f"eval_race_finished_{map_status}_{map_name}":
-            end_race_stats["race_finished"],
+            1 if end_race_stats["race_finished"] else 0,
         f"mean_action_gap_{map_name}": -(np.array(rollout_results["q_values"]) - np.array(rollout_results["q_values"]).max(axis=1,initial=None)
                                          .reshape(-1, 1)).mean(),
         f"single_zone_reached_{map_status}_{map_name}": rollout_results["furthest_zone_idx"],
@@ -369,8 +371,7 @@ def collect_race_stats(
         "tmi_protection_cutoff": end_race_stats["tmi_protection_cutoff"],
         "worker_time_in_rollout_percentage": rollout_results["worker_time_in_rollout_percentage"],
 
-        "race_finished": end_race_stats.get("race_finished"),
-        "race_time": end_race_stats.get("race_time"),
+        "race_time": end_race_stats.get("race_time") / 1000,
         "ratio_completion": end_race_stats.get("ratio_completion"),
         "max_speed": end_race_stats.get("max_speed"),
         "avg_speed": end_race_stats.get("avg_speed"),
@@ -404,10 +405,10 @@ def collect_race_stats(
                 if reference_time_name in reference_times[map_name]:
                     reference_time = reference_times[map_name][reference_time_name]
                     race_stats[f"eval_ratio_{map_status}_{reference_time_name}_{map_name}"] = (
-                            100 * (end_race_stats["race_time"] / 1000) / reference_time
+                           (end_race_stats["race_time"] / 1000) / reference_time
                     )
                     race_stats[f"eval_agg_ratio_{map_status}_{reference_time_name}"] = (
-                            100 * (end_race_stats["race_time"] / 1000) / reference_time
+                            (end_race_stats["race_time"] / 1000) / reference_time
                     )
 
     for i in [0]:

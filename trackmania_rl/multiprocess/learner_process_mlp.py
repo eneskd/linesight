@@ -378,10 +378,6 @@ def learner_process_fn(
         while should_train:
             train_start_time = time.perf_counter()
 
-            # Debug info
-            print(accumulated_stats["cumul_number_single_memories_used"] + offset_cumul_number_single_memories_used)
-            print(accumulated_stats["cumul_number_single_memories_should_have_been_used"])
-
             # Sample batch from buffer
             batch_data = sample_batch_from_buffer(buffer, config_copy.batch_size)
 
@@ -418,7 +414,9 @@ def learner_process_fn(
                 accumulated_stats["alltime_min_ms"][key] = train_duration_ms
 
             # Add to history for later analysis
-            loss_history.append(stats["loss"])
+
+            if not math.isinf(stats["loss"]):
+                loss_history.append(stats["loss"])
             if not math.isinf(stats["grad_norm"]):
                 grad_norm_history.append(stats["grad_norm"])
 
