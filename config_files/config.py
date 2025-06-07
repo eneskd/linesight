@@ -28,10 +28,10 @@ from config_files.user_config import *
 W_downsized = 160
 H_downsized = 120
 
-run_name = "mlp_test_006"
+run_name = "lstm_test_001"
 running_speed = 80
 
-agent_type = "mlp"  # "mlp", "iqn", "lstm"
+agent_type = "lstm"  # "mlp", "iqn", "lstm"
 
 
 
@@ -80,11 +80,20 @@ discard_non_greedy_actions_in_nsteps = True
 buffer_test_ratio = 0.05
 
 engineered_speedslide_reward_schedule = [
-    (0, 0),
+    (0, 0),  # Start with no reward for neoslide
+    (1_000_000 * global_schedule_speed, 0.02),  # Introduce small reward after 1M steps
+    (3_000_000 * global_schedule_speed, 0.04),  # Slightly increased reward
+    (5_000_000 * global_schedule_speed, 0.08),  # Moderate reward
+    (7_000_000 * global_schedule_speed, 0.12),  # Higher reward for advanced training
 ]
 engineered_neoslide_reward_schedule = [
-    (0, 0),
+    (0, 0),  # Start with no reward for neoslide
+    (1_000_000 * global_schedule_speed, 0.02),  # Introduce small reward after 1M steps
+    (3_000_000 * global_schedule_speed, 0.04),   # Slightly increased reward
+    (5_000_000 * global_schedule_speed, 0.08),   # Moderate reward
+    (7_000_000 * global_schedule_speed, 0.12),   # Higher reward for advanced training
 ]
+
 engineered_kamikaze_reward_schedule = [
     (0, 0),
 ]
@@ -93,8 +102,8 @@ engineered_close_to_vcp_reward_schedule = [
 ]
 
 n_steps = 3
-constant_reward_per_ms = -5 / 5000
-reward_per_m_advanced_along_centerline = 15 / 500
+constant_reward_per_ms = -10 / 5000
+reward_per_m_advanced_along_centerline = 5 / 500
 
 number_times_single_memory_is_used_before_discard = 32  # 32 // 4
 
@@ -105,9 +114,9 @@ memory_size_schedule = [
 ]
 lr_schedule = [
     (0, 1e-3),
-    (3_000_000 * global_schedule_speed, 5e-5),
-    (12_000_000 * global_schedule_speed, 5e-5),
-    (15_000_000 * global_schedule_speed, 1e-5),
+    (3_000_000 * global_schedule_speed, 1e-4),
+    (12_000_000 * global_schedule_speed, 1e-4),
+    (15_000_000 * global_schedule_speed, 3e-5),
 ]
 tensorboard_suffix_schedule = [
     (0, ""),
@@ -174,7 +183,7 @@ update_inference_network_every_n_actions = 20
 
 target_self_loss_clamp_ratio = 4
 
-final_speed_reward_as_if_duration_s = 0
+final_speed_reward_as_if_duration_s = 1
 final_speed_reward_per_m_per_s = reward_per_m_advanced_along_centerline * final_speed_reward_as_if_duration_s
 
 shaped_reward_dist_to_cur_vcp = -0.2
@@ -260,8 +269,8 @@ map_cycle = []
 
 
 map_cycle += [
-    repeat(("map5", '"My Challenges/Map5.Challenge.Gbx"', "map5_0.5m_cl.npy", True, True), 4),
-    repeat(("map5", '"My Challenges/Map5.Challenge.Gbx"', "map5_0.5m_cl.npy", False, True), 1),
+    # repeat(("map5", '"My Challenges/Map5.Challenge.Gbx"', "map5_0.5m_cl.npy", True, True), 4),
+    # repeat(("map5", '"My Challenges/Map5.Challenge.Gbx"', "map5_0.5m_cl.npy", False, True), 1),
     # repeat(("map8", '"My Challenges/Map8.Challenge.Gbx"', "map8_0.5m_cl.npy", True, True), 4),
     # repeat(("map8", '"My Challenges/Map8.Challenge.Gbx"', "map8_0.5m_cl.npy", False, True), 1),
     # repeat(("yosh1", '"My Challenges\Yosh1.Challenge.Gbx"', "yosh1_0.5m_clprog.npy", True, True), 4),
@@ -282,8 +291,8 @@ map_cycle += [
     # repeat(("B03", '"Official Maps\Green\B03-Race.Challenge.Gbx"', "B03-Race_10m_cl.npy", False, True), 1),
     # repeat(("B05", '"Official Maps\Green\B05-Race.Challenge.Gbx"', "B05-Race_10m_cl.npy", True, True), 4),
     # repeat(("B05", '"Official Maps\Green\B05-Race.Challenge.Gbx"', "B05-Race_10m_cl.npy", False, True), 1),
-    # repeat(("hock", "ESL-Hockolicious.Challenge.Gbx", "ESL-Hockolicious_0.5m_cl2.npy", True, True), 4),
-    # repeat(("hock", "ESL-Hockolicious.Challenge.Gbx", "ESL-Hockolicious_0.5m_cl2.npy", False, True), 1),
+    repeat(("hock", "ESL-Hockolicious.Challenge.Gbx", "ESL-Hockolicious_0.5m_cl2.npy", True, True), 4),
+    repeat(("hock", "ESL-Hockolicious.Challenge.Gbx", "ESL-Hockolicious_0.5m_cl2.npy", False, True), 1),
     # repeat(("A02", f'"Official Maps\A02-Race.Challenge.Gbx"', "A02-Race_0.5m_cl2.npy", False, False), 1),
     # repeat(("yellowmile", f'"The Yellow Mile_.Challenge.Gbx"', "YellowMile_0.5m_cl.npy", False, False), 1),
     # repeat(("te86", f'"te 86.Challenge.Gbx"', "te86_0.5m_cl.npy", False, False), 1),

@@ -1,872 +1,635 @@
+"""
+LSTM Learner Process for Trackmania RL
+
+This file implements the main training loop for LSTM-based agents, handling:
+- Sequence-based training with temporal dependencies
+- LSTM hidden state management
+- Sequence sampling from replay buffer
+- Tensorboard statistics tracking
+"""
+
+import copy
+import importlib
+import math
+import random
+import sys
 import time
-import joblib
-import os
+from collections import defaultdict
+from datetime import datetime
 from pathlib import Path
-from collections import defaultdict, deque
 
 import numpy as np
 import torch
+import torch.nn as nn
 from torch import multiprocessing as mp
+from multiprocessing.connection import wait
 from torch.utils.tensorboard import SummaryWriter
-from torch.optim.lr_scheduler import ReduceLROnPlateau
 
 from config_files import config_copy
 from config_files import lstm_config_copy
-
-from trackmania_rl import buffer_management, utilities
+from trackmania_rl import utilities
 from trackmania_rl.agents.lstm import make_untrained_lstm_agent
+from trackmania_rl.buffer_lstm import LSTMReplayBuffer
+from trackmania_rl.multiprocess.learner_process_utils import (
+    load_checkpoint,
+    get_rollout_from_queues,
+    save_checkpoint,
+    update_target_network,
+    save_good_runs,
+)
 
-from trackmania_rl.multiprocess.buffer_lstm import LSTMReplayBuffer
-
-# Helper function to check tensors for numerical issues
-def check_tensor_for_issues(tensor, name):
-    """Check if tensor contains NaN or Inf values."""
-    if tensor is None:
-        return False
-    if torch.isnan(tensor).any():
-        print(f"WARNING: NaN detected in {name}")
-        return True
-    if torch.isinf(tensor).any():
-        print(f"WARNING: Inf detected in {name}")
-        return True
-    return False
+from trackmania_rl.tensorboard_logging_utils import (
+    setup_tensorboard,
+    get_tensorboard_writer,
+    log_training_step,
+    log_training_step_to_tensorboard,
+    log_race_stats_to_tensorboard,
+    log_detailed_tensorboard_stats,
+    collect_periodic_stats,
+    collect_race_stats
+)
 
 
-def dqn_loss(q_values, actions, targets, weights=None):
-    """
-    Standard DQN loss: MSE between Q(s,a) and target.
-    q_values: (batch, seq_len, n_actions)
-    actions: (batch, seq_len) int64
-    targets: (batch, seq_len) float32
-    weights: (batch,) float32 - importance sampling weights for prioritized replay
-    """
-    q_selected = q_values.gather(2, actions.unsqueeze(2)).squeeze(2)
-    td_errors = targets - q_selected
-    
-    if weights is not None:
-        # Apply importance sampling weights
-        return (td_errors.pow(2) * weights.unsqueeze(1)).mean()
-    else:
-        return td_errors.pow(2).mean()
+def initialize_networks_and_optimizer(accumulated_stats):
+    """Initialize LSTM models and optimizer."""
+    online_network, uncompiled_online_network = make_untrained_lstm_agent(config_copy.use_jit, is_inference=False)
+    target_network, _ = make_untrained_lstm_agent(config_copy.use_jit, is_inference=False)
 
-def validate_on_held_out_maps(
-    online_network,
-    step,
-    validation_maps,
-    tensorboard_writer,
-    save_dir,
-    accumulated_stats,
-    best_validation_reward
-):
-    """
-    Evaluate the model on held-out validation maps to check for generalization performance
-    
-    Args:
-        online_network: The current LSTM network to evaluate
-        step: Current training step
-        validation_maps: List of paths to validation maps
-        tensorboard_writer: TensorBoard writer for logging
-        save_dir: Directory to save best validation model
-        accumulated_stats: Dictionary of accumulated statistics
-        best_validation_reward: Current best validation reward
-    
-    Returns:
-        The updated best validation reward
-    """
-    print(f"\nRunning validation at step {step}...")
-    
-    if not validation_maps:
-        print("No validation maps defined. Skipping validation.")
-        return best_validation_reward
-    
-    # Import necessary components for validation
-    from trackmania_rl.tmi_interaction.environment import TrackmaniaEnvironment
-    from trackmania_rl.multiprocess.collector_process_lstm import LSTMInferer
-    
-    # Configure inferer for validation
-    inferer = LSTMInferer(online_network, "cuda", lstm_config_copy)
-    
-    results = {}
-    
-    for map_path in validation_maps:
-        map_name = os.path.basename(map_path)
-        print(f"Validating on map: {map_name}")
-        
-        # Create environment with this map
-        try:
-            env = TrackmaniaEnvironment(
-                map_path=map_path,
-                game_config=config_copy,
-                headless=True
-            )
-        except Exception as e:
-            print(f"Error creating environment for map {map_name}: {e}")
-            continue
-        
-        # Run several episodes on this map
-        map_rewards = []
-        map_lengths = []
-        num_validation_episodes = getattr(lstm_config_copy, "num_validation_episodes", 5)
-        
-        for episode in range(num_validation_episodes):
-            episode_reward = 0
-            episode_length = 0
-            done = False
-            
-            try:
-                obs = env.reset()
-                
-                # Reset hidden state at the start of each episode
-                inferer.reset_hidden_state()
-                
-                while not done:
-                    # Process observation
-                    processed_image = obs.get('image')  # Adjust based on your preprocessing
-                    float_inputs = torch.tensor(obs.get('inputs', []), dtype=torch.float32)
-                    
-                    # Get action from the network, passing and updating hidden state
-                    q_values = inferer(processed_image, float_inputs, obs.get('info', {}))
-                    action = q_values.argmax().item()
-                    
-                    # Execute action
-                    next_obs, reward, done, info = env.step(action)
-                    
-                    # Update tracking variables
-                    episode_reward += reward
-                    episode_length += 1
-                    obs = next_obs
-                    
-                    # Optional early stopping for very long episodes
-                    max_episode_length = getattr(lstm_config_copy, "max_validation_episode_length", 2000)
-                    if episode_length >= max_episode_length:
-                        done = True
-                
-                map_rewards.append(episode_reward)
-                map_lengths.append(episode_length)
-                
-                print(f"  Episode {episode+1}: Reward = {episode_reward:.2f}, Length = {episode_length}")
-                
-            except Exception as e:
-                print(f"Error during validation episode {episode+1} on map {map_name}: {e}")
-                continue
-        
-        # Store results for this map if we have any valid episodes
-        if map_rewards:
-            results[map_name] = {
-                'mean_reward': np.mean(map_rewards),
-                'std_reward': np.std(map_rewards),
-                'mean_length': np.mean(map_lengths),
-                'std_length': np.std(map_lengths),
-            }
-        
-        # Close the environment
-        try:
-            env.close()
-        except:
-            pass
-    
-    # Log the validation results
-    print("\nValidation Results:")
-    
-    if not results:
-        print("  No valid validation results collected.")
-        return best_validation_reward
-    
-    for map_name, stats in results.items():
-        print(f"  {map_name}: Mean Reward = {stats['mean_reward']:.2f} ± {stats['std_reward']:.2f}")
-        
-        # Log to TensorBoard
-        tensorboard_writer.add_scalar(f'validation/{map_name}/mean_reward', stats['mean_reward'], step)
-        tensorboard_writer.add_scalar(f'validation/{map_name}/mean_length', stats['mean_length'], step)
-    
-    # Calculate and log the average across all validation maps
-    mean_validation_reward = np.mean([stats['mean_reward'] for stats in results.values()])
-    tensorboard_writer.add_scalar('validation/overall_mean_reward', mean_validation_reward, step)
-    
-    # Store best validation performance
-    new_best = False
-    if mean_validation_reward > best_validation_reward:
-        new_best = True
-        best_validation_reward = mean_validation_reward
-        
-        # Save a special validation checkpoint
-        validation_checkpoint_path = save_dir / 'lstm_best_validation_model.pt'
-        torch.save({
-            'online_network': online_network.state_dict(),
-            'train_step': step,
-            'accumulated_stats': accumulated_stats,
-            'validation_reward': mean_validation_reward,
-            'validation_results': results
-        }, validation_checkpoint_path)
-        print(f"New best validation performance! Saved model with reward {mean_validation_reward:.2f}")
-    
-    print("Validation complete\n")
-    return best_validation_reward
+    print("Learner process started (LSTM agent).")
+    print(online_network)
+    utilities.count_parameters(online_network)
 
-def learner_process_fn(
-    rollout_queues,
-    uncompiled_shared_network,
-    shared_network_lock,
-    shared_steps: mp.Value,
-    base_dir: Path,
-    save_dir: Path,
-    tensorboard_base_dir: Path,
-):
-    # Add this configuration parameter
-    use_double_q = getattr(lstm_config_copy, "use_double_q", True)
-    online_network, uncompiled_online_network = make_untrained_lstm_agent(
-        jit=config_copy.use_jit,
-        is_inference=False,
-    )
-    target_network, _ = make_untrained_lstm_agent(
-        jit=config_copy.use_jit,
-        is_inference=False,
-    )
-
-    # Initialize accumulated_stats only once
-    accumulated_stats = defaultdict(int)
-    try:
-        loaded_stats = joblib.load(save_dir / "lstm_accumulated_stats.joblib")
-        accumulated_stats.update(loaded_stats)
-        shared_steps.value = accumulated_stats.get("cumul_number_frames_played", 0)
-        print(" =====================      Learner LSTM stats loaded !      ============================")
-    except Exception as e:
-        print(" Learner LSTM could not load stats:", e)
-
+    # Initialize optimizer with proper learning rate from schedule
     optimizer = torch.optim.RAdam(
         online_network.parameters(),
-        lr=utilities.from_exponential_schedule(config_copy.lr_schedule, accumulated_stats["cumul_number_frames_played"]),
+        lr=utilities.from_exponential_schedule(config_copy.lr_schedule,
+                                               accumulated_stats["cumul_number_frames_played"]),
         eps=config_copy.adam_epsilon,
         betas=(config_copy.adam_beta1, config_copy.adam_beta2),
     )
+
     scaler = torch.amp.GradScaler("cuda")
-    tensorboard_writer = SummaryWriter(log_dir=str(tensorboard_base_dir / (config_copy.run_name + "_lstm")))
+
+    return online_network, uncompiled_online_network, target_network, optimizer, scaler
+
+
+def update_config_parameters(accumulated_stats):
+    """Update parameters based on current config and training progress."""
+    current_step = accumulated_stats["cumul_number_frames_played"]
+
+    # Get current learning rate and gamma from schedules
+    learning_rate = utilities.from_exponential_schedule(config_copy.lr_schedule, current_step)
+    weight_decay = config_copy.weight_decay_lr_ratio * learning_rate
+    gamma = utilities.from_linear_schedule(config_copy.gamma_schedule, current_step)
+
+    # Get current tensorboard suffix from schedule
+    tensorboard_suffix = utilities.from_staircase_schedule(
+        config_copy.tensorboard_suffix_schedule, current_step
+    )
+
+    return {
+        "learning_rate": learning_rate,
+        "weight_decay": weight_decay,
+        "gamma": gamma,
+        "tensorboard_suffix": tensorboard_suffix,
+    }
+
+
+def update_optimizer_params(optimizer, learning_rate):
+    """Update optimizer parameters."""
+    for param_group in optimizer.param_groups:
+        param_group["lr"] = learning_rate
+        param_group["epsilon"] = config_copy.adam_epsilon
+        param_group["betas"] = (config_copy.adam_beta1, config_copy.adam_beta2)
+
+
+def lstm_dqn_loss(q_values, actions, targets, weights=None, mask=None):
+    """
+    Compute DQN loss for LSTM sequences.
     
-    # Print Double Q-learning status
-    print(f"Using Double Q-learning: {use_double_q}")
+    Args:
+        q_values: (batch, seq_len, n_actions) - Q-values from network
+        actions: (batch, seq_len) - Actions taken
+        targets: (batch, seq_len) - Target Q-values
+        weights: (batch,) - Importance sampling weights (optional)
+        mask: (batch, seq_len) - Mask for valid timesteps (optional)
     
-    # Initialize learning rate scheduler
-    lr_scheduler = ReduceLROnPlateau(
-        optimizer, 
-        mode='max',  # Since we want to maximize reward
-        factor=getattr(lstm_config_copy, "lr_reduction_factor", 0.5),  # Multiply LR by this factor on plateau
-        patience=getattr(lstm_config_copy, "lr_patience", 5000),  # Number of steps with no improvement before reducing LR
-        verbose=True,
-        threshold=getattr(lstm_config_copy, "lr_threshold", 0.01),  # Minimum significant improvement
-        min_lr=getattr(lstm_config_copy, "min_lr", 1e-6)  # Minimum learning rate
+    Returns:
+        loss: Scalar loss value
+        td_errors: (batch, seq_len) - TD errors for priority updates
+    """
+    batch_size, seq_len, n_actions = q_values.shape
+    
+    # Gather Q-values for taken actions
+    q_taken = q_values.gather(2, actions.unsqueeze(-1)).squeeze(-1)  # (batch, seq_len)
+    
+    # Compute TD errors
+    td_errors = targets - q_taken  # (batch, seq_len)
+    
+    # Apply mask if provided (to handle variable length sequences)
+    if mask is not None:
+        td_errors = td_errors * mask
+        
+    # Compute squared TD errors
+    squared_errors = td_errors ** 2
+    
+    # Average over sequence length (considering mask)
+    if mask is not None:
+        # Only average over valid timesteps
+        valid_steps = mask.sum(dim=1, keepdim=True).clamp(min=1)  # (batch, 1)
+        sequence_loss = squared_errors.sum(dim=1) / valid_steps.squeeze()  # (batch,)
+    else:
+        sequence_loss = squared_errors.mean(dim=1)  # (batch,)
+    
+    # Apply importance sampling weights if provided
+    if weights is not None:
+        sequence_loss = sequence_loss * weights
+    
+    # Final loss is mean over batch
+    loss = sequence_loss.mean()
+    
+    return loss, td_errors
+
+
+def process_rollout_lstm(rollout_results, buffer, gamma, accumulated_stats):
+    """Process rollout data and add episodes to LSTM buffer."""
+    # Import reward calculation function
+    from trackmania_rl.reward_calculation import calculate_frame_rewards
+    
+    # Get current parameters for reward calculation
+    current_step = accumulated_stats["cumul_number_frames_played"]
+    engineered_speedslide_reward = utilities.from_linear_schedule(
+        config_copy.engineered_speedslide_reward_schedule, current_step
+    )
+    engineered_neoslide_reward = utilities.from_linear_schedule(
+        config_copy.engineered_neoslide_reward_schedule, current_step
+    )
+    engineered_kamikaze_reward = utilities.from_linear_schedule(
+        config_copy.engineered_kamikaze_reward_schedule, current_step
+    )
+    engineered_close_to_vcp_reward = utilities.from_linear_schedule(
+        config_copy.engineered_close_to_vcp_reward_schedule, current_step
     )
     
-    # Track performance for LR scheduling
-    performance_metric_history = deque(maxlen=getattr(lstm_config_copy, "performance_history_size", 100))
-
-    # Create LSTM buffer with prioritized experience replay if enabled
-    # Note: The buffer should maintain sequence continuity for proper LSTM training
-    if getattr(lstm_config_copy, "use_prioritized_replay", False):
-        buffer = LSTMReplayBuffer(
-            capacity=lstm_config_copy.replay_buffer_capacity, 
-            seq_len=lstm_config_copy.lstm_seq_len,
-            use_prioritized=True,
-            alpha=getattr(lstm_config_copy, "prio_alpha", 0.6),
-            beta=getattr(lstm_config_copy, "prio_beta", 0.4),
-            beta_annealing=getattr(lstm_config_copy, "prio_beta_annealing", 0.001)
-        )
-    else:
-        buffer = LSTMReplayBuffer(
-            capacity=lstm_config_copy.replay_buffer_capacity, 
-            seq_len=lstm_config_copy.lstm_seq_len
-        )
-        
-    # Define max number of episodes to track
-    max_episodes_to_track = 100
+    # Calculate rewards for the episode
+    frame_rewards = calculate_frame_rewards(
+        rollout_results,
+        engineered_speedslide_reward,
+        engineered_neoslide_reward,
+        engineered_kamikaze_reward,
+        engineered_close_to_vcp_reward,
+    )
     
-    # Load episode rewards history if available
-    if "episode_rewards" in accumulated_stats:
-        # Convert existing rewards to deque with max length
-        episode_rewards = deque(accumulated_stats["episode_rewards"], maxlen=max_episodes_to_track)
-        print(f" Loaded {len(episode_rewards)} previous episode rewards")
-    else:
-        episode_rewards = deque(maxlen=max_episodes_to_track)
-        
-    # Load best average reward if available
-    if "best_avg_reward" in accumulated_stats:
-        best_avg_reward = accumulated_stats["best_avg_reward"]
-        print(f" Loaded previous best average reward: {best_avg_reward:.2f}")
-        
-    # Load performance metric history if available
-    if "performance_metric_history" in accumulated_stats:
-        performance_metric_history = deque(
-            accumulated_stats["performance_metric_history"], 
-            maxlen=getattr(lstm_config_copy, "performance_history_size", 100)
-        )
-        print(f" Loaded {len(performance_metric_history)} previous performance metrics")
-    else:
-        performance_metric_history = deque(maxlen=getattr(lstm_config_copy, "performance_history_size", 100))
+    # Create terminal flags - True for the last frame if race finished, False otherwise
+    n_frames = len(rollout_results["frames"])
+    terminals = [False] * n_frames
+    if "race_time" in rollout_results:  # Race finished
+        terminals[-1] = True
     
-    # =========================
-    # Load existing weights/stats if available
-    # =========================
-    try:
-        online_network.load_state_dict(torch.load(save_dir / "lstm_weights1.torch"))
-        target_network.load_state_dict(torch.load(save_dir / "lstm_weights2.torch"))
-        print(" =====================     Learner LSTM weights loaded !     ============================")
-    except Exception as e:
-        print(" Learner LSTM could not load weights:", e)
+    # Convert rollout to episode format for LSTM buffer
+    episode_data = {
+        "frames": rollout_results["frames"],
+        "state_float": rollout_results["state_float"],
+        "actions": rollout_results["actions"],
+        "rewards": frame_rewards,
+        "terminals": terminals,
+    }
+    
+    # Add episode to buffer
+    buffer.add_episode(episode_data)
+    
+    # Update accumulated stats
+    episode_length = len(rollout_results["frames"])
+    accumulated_stats["cumul_number_memories_generated"] += episode_length
+    accumulated_stats["cumul_number_single_memories_should_have_been_used"] += (
+        config_copy.number_times_single_memory_is_used_before_discard * episode_length
+    )
+    
+    return buffer, episode_length
 
-    try:
-        optimizer.load_state_dict(torch.load(save_dir / "lstm_optimizer.torch"))
-        print(" =====================     Learner LSTM optimizer loaded !     ============================")
-    except Exception as e:
-        print(" Learner LSTM could not load optimizer state:", e)
+
+def training_step_lstm(online_network, target_network, optimizer, scaler, batch_data):
+    """Perform a single LSTM training step."""
+    # Unpack batch data
+    img_seq = batch_data["frames"]  # (batch, seq_len, 1, H, W)
+    float_seq = batch_data["state_float"]  # (batch, seq_len, float_dim)
+    actions = batch_data["actions"]  # (batch, seq_len)
+    rewards = batch_data["rewards"]  # (batch, seq_len)
+    terminals = batch_data["terminals"]  # (batch, seq_len)
+    weights = batch_data.get("weights", None)  # (batch,) - importance sampling weights
+    
+    batch_size, seq_len = actions.shape
+    
+    optimizer.zero_grad(set_to_none=True)
+
+    with torch.amp.autocast(device_type="cuda", dtype=torch.float16):
+        # Forward pass through online network
+        q_values, _ = online_network(img_seq, float_seq)  # (batch, seq_len, n_actions)
         
-    # Try to load scheduler state if it exists
-    try:
-        scheduler_state = torch.load(save_dir / "lstm_scheduler.torch")
-        lr_scheduler.load_state_dict(scheduler_state)
-        print(" =====================     Learner LSTM scheduler loaded !     ============================")
-    except Exception as e:
-        print(" Learner LSTM could not load scheduler state:", e)
+        # Compute targets using target network
+        with torch.no_grad():
+            # For LSTM, we need to compute targets for each timestep
+            # Create next state sequences (shift by 1 timestep)
+            next_img_seq = torch.zeros_like(img_seq)
+            next_float_seq = torch.zeros_like(float_seq)
+            
+            # Shift sequences to get next states
+            next_img_seq[:, :-1] = img_seq[:, 1:]
+            next_float_seq[:, :-1] = float_seq[:, 1:]
+            # Last timestep uses same state (will be masked out by terminals)
+            next_img_seq[:, -1] = img_seq[:, -1]
+            next_float_seq[:, -1] = float_seq[:, -1]
+            
+            # Get Q-values for next states
+            q_next, _ = target_network(next_img_seq, next_float_seq)  # (batch, seq_len, n_actions)
+            max_next_q = q_next.max(dim=2)[0]  # (batch, seq_len)
+            
+            # Compute targets: r + gamma * max_q_next * (1 - terminal)
+            gamma_tensor = torch.full_like(rewards, lstm_config_copy.gamma)
+            targets = rewards + gamma_tensor * max_next_q * (1 - terminals.float())
 
-    try:
-        scaler.load_state_dict(torch.load(save_dir / "lstm_scaler.torch"))
-        print(" =====================     Learner LSTM scaler loaded !     ============================")
-    except Exception as e:
-        print(" Learner LSTM could not load scaler state:", e)
+        # Compute loss
+        loss, td_errors = lstm_dqn_loss(q_values, actions, targets, weights)
 
+    # Backpropagation with gradient scaling
+    scaler.scale(loss).backward()
+    scaler.unscale_(optimizer)
+
+    # Gradient clipping
+    grad_norm = torch.nn.utils.clip_grad_norm_(
+        online_network.parameters(),
+        config_copy.clip_grad_norm
+    ).detach().cpu().item()
+
+    torch.nn.utils.clip_grad_value_(
+        online_network.parameters(),
+        config_copy.clip_grad_value
+    )
+
+    # Optimizer step and scaler update
+    scaler.step(optimizer)
+    scaler.update()
+
+    # Compute statistics
+    stats = {
+        "loss": loss.detach().cpu().item(),
+        "mean_q": q_values.mean().detach().cpu().item(),
+        "max_q": q_values.max().detach().cpu().item(),
+        "min_q": q_values.min().detach().cpu().item(),
+        "grad_norm": grad_norm,
+        "max_next_q": max_next_q.mean().item(),
+        "reward_mean": rewards.mean().item(),
+        "reward_min": rewards.min().item(),
+        "reward_max": rewards.max().item(),
+        "reward_std": rewards.std().item(),
+        "td_errors": td_errors,
+    }
+
+    return stats
+
+
+def learner_process_fn(
+        rollout_queues,
+        uncompiled_shared_network,
+        shared_network_lock,
+        shared_steps: mp.Value,
+        base_dir: Path,
+        save_dir: Path,
+        tensorboard_base_dir: Path,
+):
+    """
+    Main learner process function for LSTM agent training.
+
+    Args:
+        rollout_queues: Queues containing rollout data from collector processes
+        uncompiled_shared_network: Network shared with collector processes
+        shared_network_lock: Lock for synchronizing shared network updates
+        shared_steps: Shared counter for tracking total frames
+        base_dir: Base directory for saving models and data
+        save_dir: Directory to save checkpoints
+        tensorboard_base_dir: Directory for tensorboard logs
+    """
+    # Setup TensorBoard
+    setup_tensorboard(tensorboard_base_dir)
+
+    # Initialize stats tracking
+    accumulated_stats = defaultdict(int)
+    accumulated_stats["alltime_min_ms"] = {}
+    accumulated_stats["rolling_mean_ms"] = {}
+
+    # Create save directory if it doesn't exist
+    save_dir.mkdir(parents=True, exist_ok=True)
+
+    # Initialize models and optimizer
+    online_network, uncompiled_online_network, target_network, optimizer, scaler = initialize_networks_and_optimizer(
+        accumulated_stats)
+
+    # Load checkpoint if available
+    load_checkpoint(save_dir, online_network, target_network, optimizer, scaler, accumulated_stats, shared_steps)
+
+    # Sync shared network with loaded weights
     with shared_network_lock:
         uncompiled_shared_network.load_state_dict(uncompiled_online_network.state_dict())
 
+    # Initialize tracking variables
+    previous_alltime_min = None
+    time_last_save = time.perf_counter()
+    save_frequency_s = config_copy.save_frequency_s if hasattr(config_copy, 'save_frequency_s') else 5 * 60
 
+    queue_check_order = list(range(len(rollout_queues)))
+    rollout_queue_readers = [q._reader for q in rollout_queues]
+
+    time_waited_for_workers_since_last_tensorboard_write = 0
+    time_training_since_last_tensorboard_write = 0
+    time_testing_since_last_tensorboard_write = 0
 
     # Ensure required keys exist in accumulated_stats
     if "rolling_mean_ms" not in accumulated_stats:
         accumulated_stats["rolling_mean_ms"] = {}
 
-    accumulated_stats["cumul_number_single_memories_should_have_been_used"] = accumulated_stats.get("cumul_number_single_memories_used", 0)
+    accumulated_stats["cumul_number_single_memories_should_have_been_used"] = accumulated_stats.get(
+        "cumul_number_single_memories_used", 0)
     transitions_learned_last_save = accumulated_stats.get("cumul_number_single_memories_used", 0)
-    neural_net_reset_counter = 0
-    single_reset_flag = config_copy.single_reset_flag
 
-    # Stats tracking
-    stats = defaultdict(list)
-    last_target_update = 0
-    last_save = 0
-    last_shared_update = 0
-    step = shared_steps.value if hasattr(shared_steps, "value") else 0
-    wait_time_total = 0  # Total time spent waiting for rollouts
-    cumul_number_batches_done = 0  # Track number of batches processed
-    
-    # Define update frequencies
-    target_update_frequency = getattr(lstm_config_copy, "target_update_frequency", 10)
-    network_update_frequency = getattr(lstm_config_copy, "network_update_frequency", 
-                                      config_copy.send_shared_network_every_n_batches)
-    save_frequency = getattr(lstm_config_copy, "save_frequency", 1000)
-    validation_frequency = getattr(lstm_config_copy, "validation_frequency", 10000)
-    
-    # Performance tracking for conditional saving
-    best_avg_reward = float('-inf')
-    best_validation_reward = float('-inf')
-    episode_rewards = []
-    reward_improvement_threshold = getattr(lstm_config_copy, "reward_improvement_threshold", 1.05)  # 5% improvement
-    
-    print("Learner process started.")
-    print(f"Replay buffer capacity: {buffer.capacity}, LSTM sequence length: {buffer.seq_len}")
+    # Setup LSTM replay buffer
+    buffer = LSTMReplayBuffer(
+        capacity=lstm_config_copy.replay_buffer_capacity,
+        seq_len=lstm_config_copy.lstm_seq_len,
+        use_prioritized=False,  # Can be made configurable
+        config=lstm_config_copy
+    )
+
+    # Setup TensorBoard writer
+    config_values = update_config_parameters(accumulated_stats)
+    tensorboard_suffix = config_values["tensorboard_suffix"]
+    tensorboard_writer = get_tensorboard_writer(
+        tensorboard_base_dir,
+        config_copy,
+        tensorboard_suffix
+    )
+
+    # Initialize tracking histories
+    loss_history = []
+    train_on_batch_duration_history = []
+    grad_norm_history = []
+    layer_grad_norm_history = defaultdict(list)
+
+    print(f"LSTM replay buffer capacity: {lstm_config_copy.replay_buffer_capacity}")
+    print(f"LSTM sequence length: {lstm_config_copy.lstm_seq_len}")
     print(f"Batch size: {lstm_config_copy.lstm_batch_size}")
     print(f"Initial shared step value: {shared_steps.value}")
-    print(f"Target update frequency: {target_update_frequency} steps")
-    print(f"Network update frequency: {network_update_frequency} steps")
-    print(f"Save frequency: {save_frequency} steps")
-    print(f"Validation frequency: {validation_frequency} steps")
-    
-    # Get validation maps if defined
-    validation_maps = getattr(lstm_config_copy, "validation_maps", [])
-    if validation_maps:
-        print(f"Found {len(validation_maps)} validation maps for periodic evaluation")
-    else:
-        print("No validation maps defined. Validation will be skipped.")
 
+    # Load step from accumulated_stats if available, otherwise start from 0
+    step = accumulated_stats.get("training_step", 0)
+    print(f"Starting LSTM training from step {step}")
+
+    # ========================================================
+    # Main Training Loop
+    # ========================================================
     while True:
-        wait_start = time.perf_counter()
-        # Always block until rollout_results is available to avoid UnboundLocalError
-        while True:
-            rollout_found = False
-            for idx, queue in enumerate(rollout_queues):
-                if not queue.empty():
-                    (
-                        rollout_results,
-                        end_race_stats,
-                        fill_buffer,
-                        is_explo,
-                        map_name,
-                        map_status,
-                        rollout_duration,
-                        loop_number,
-                    ) = queue.get()
-                    rollout_found = True
-                    break
-            if rollout_found:
+        # Wait for data from collector processes
+        before_wait_time = time.perf_counter()
+        wait(rollout_queue_readers)
+        time_waited = time.perf_counter() - before_wait_time
+
+        if time_waited > 1:
+            print(f"Warning: learner waited {time_waited:.2f} seconds for workers to provide memories")
+
+        time_waited_for_workers_since_last_tensorboard_write += time_waited
+
+        # Get rollout data from worker queues
+        rollout_data, idx = get_rollout_from_queues(rollout_queues, queue_check_order)
+
+        if rollout_data:
+            (
+                rollout_results,
+                end_race_stats,
+                fill_buffer,
+                is_explo,
+                map_name,
+                map_status,
+                rollout_duration,
+                loop_number,
+            ) = rollout_data
+
+        # Reload config and update parameters
+        importlib.reload(config_copy)
+        importlib.reload(lstm_config_copy)
+
+        config_values = update_config_parameters(accumulated_stats)
+
+        # Update tensorboard writer if suffix changed
+        if config_values["tensorboard_suffix"] != tensorboard_suffix:
+            tensorboard_suffix = config_values["tensorboard_suffix"]
+            tensorboard_writer = get_tensorboard_writer(
+                tensorboard_base_dir,
+                config_copy,
+                tensorboard_suffix
+            )
+
+        # Update optimizer parameters
+        update_optimizer_params(optimizer, config_values["learning_rate"])
+
+        # Extract current parameters for use in training
+        learning_rate = config_values["learning_rate"]
+        weight_decay = config_values["weight_decay"]
+        gamma = config_values["gamma"]
+
+        # Update frame count if we received new rollout data
+        if rollout_data:
+            accumulated_stats["cumul_number_frames_played"] += len(rollout_results["frames"])
+            shared_steps.value = accumulated_stats["cumul_number_frames_played"]
+
+            # Collect and log race statistics
+            race_stats = collect_race_stats(rollout_results, end_race_stats, is_explo, map_name, map_status,
+                                            rollout_duration, accumulated_stats)
+            log_race_stats_to_tensorboard(tensorboard_writer, race_stats, accumulated_stats)
+
+            # Save good runs
+            save_good_runs(base_dir, save_dir, rollout_results, end_race_stats, map_name, is_explo,
+                           accumulated_stats)
+
+            # Process rollout data and fill buffer
+            if fill_buffer:
+                buffer, episode_length = process_rollout_lstm(
+                    rollout_results, buffer, gamma, accumulated_stats
+                )
+
+        # ===============================================
+        #   LSTM Training Loop
+        # ===============================================
+
+        # Ensure model is in training mode
+        if not online_network.training:
+            online_network.train()
+
+        # Check if we should train (buffer has enough episodes)
+        min_episodes_to_start = max(1, lstm_config_copy.lstm_batch_size // 4)  # Start training with some episodes
+        should_train = (
+                len(buffer) >= min_episodes_to_start and
+                accumulated_stats["cumul_number_single_memories_used"] <=
+                accumulated_stats["cumul_number_single_memories_should_have_been_used"]
+        )
+
+        if not should_train:
+            if len(buffer) < min_episodes_to_start:
+                print(
+                    f"[Not training] Buffer too small: episodes={len(buffer)} < min_episodes={min_episodes_to_start}"
+                )
+            else:
+                print(
+                    "[Not training] Used memories condition not met: "
+                    f"cumul_number_single_memories_used ({accumulated_stats['cumul_number_single_memories_used']}) > "
+                    f"cumul_number_single_memories_should_have_been_used ({accumulated_stats['cumul_number_single_memories_should_have_been_used']})"
+                )
+
+        # Training loop - continue until conditions no longer met
+        while should_train:
+            train_start_time = time.perf_counter()
+
+            # Sample batch from LSTM buffer
+            try:
+                batch_data = buffer.sample_batch(lstm_config_copy.lstm_batch_size)
+                
+                # Move batch to GPU
+                for key in batch_data:
+                    if isinstance(batch_data[key], torch.Tensor):
+                        batch_data[key] = batch_data[key].to("cuda")
+
+                # Training step
+                stats = training_step_lstm(online_network, target_network, optimizer, scaler, batch_data)
+
+                # Track memory usage for learning rate adjustment
+                sequences_used = lstm_config_copy.lstm_batch_size * lstm_config_copy.lstm_seq_len
+                accumulated_stats["cumul_number_single_memories_used"] += sequences_used
+
+                # Log training step info
+                log_training_step(step, stats, len(buffer))
+
+                # Update stats
+                train_duration_ms = (time.perf_counter() - train_start_time) * 1000
+                train_on_batch_duration_history.append(train_duration_ms / 1000)  # Convert back to seconds for history
+                time_training_since_last_tensorboard_write += time.perf_counter() - train_start_time
+
+                # Update cumulative counters
+                accumulated_stats["cumul_number_batches_done"] += 1
+
+                # Update rolling mean for training step time
+                key = "train_step"
+                prev_mean = accumulated_stats["rolling_mean_ms"].get(key, 0)
+                alpha = 0.01  # smoothing factor
+                accumulated_stats["rolling_mean_ms"][key] = (1 - alpha) * prev_mean + alpha * train_duration_ms
+
+                # Update all-time minimum if applicable
+                if key not in accumulated_stats["alltime_min_ms"] or train_duration_ms < \
+                        accumulated_stats["alltime_min_ms"][key]:
+                    accumulated_stats["alltime_min_ms"][key] = train_duration_ms
+
+                # Add to history for later analysis
+                if not math.isinf(stats["loss"]):
+                    loss_history.append(stats["loss"])
+                if not math.isinf(stats["grad_norm"]):
+                    grad_norm_history.append(stats["grad_norm"])
+
+                # Apply weight decay
+                utilities.custom_weight_decay(online_network, 1 - weight_decay)
+
+                # Update shared network periodically
+                if accumulated_stats["cumul_number_batches_done"] % config_copy.send_shared_network_every_n_batches == 0:
+                    with shared_network_lock:
+                        uncompiled_shared_network.load_state_dict(uncompiled_online_network.state_dict())
+
+                # Update target network if needed
+                if accumulated_stats["cumul_number_batches_done"] % lstm_config_copy.target_update_frequency == 0:
+                    target_network.load_state_dict(online_network.state_dict())
+                    print(f"Updated target network at step {step}")
+
+                # Log to TensorBoard
+                log_training_step_to_tensorboard(
+                    tensorboard_writer,
+                    step,
+                    stats,
+                    len(buffer),
+                    stats["max_next_q"],
+                    train_duration_ms,
+                    accumulated_stats["rolling_mean_ms"]
+                )
+
+                # Output to console
+                sys.stdout.flush()
+                step += 1
+
+            except Exception as e:
+                print(f"Error during training step: {e}")
+                # Continue to next iteration
                 break
-            else:
-                time.sleep(0.1)  # Sleep a little to avoid busy-waiting
-        wait_time = time.perf_counter() - wait_start
-        wait_time_total += wait_time
-        if wait_time > 1.0:
-            print(f"  [Timer] Waited {wait_time:.2f} seconds for workers to provide a rollout (total waited {wait_time_total:.1f}s).")
 
-        # Compute rewards
-        n_frames = len(rollout_results["frames"])
-        rewards = np.zeros(n_frames)
-        for i in range(1, n_frames):
-            prev_state = rollout_results["state_float"][i - 1]
-            curr_state = rollout_results["state_float"][i]
-            action = rollout_results["actions"][i]
-            meters_advanced = rollout_results["meters_advanced_along_centerline"][i] - rollout_results["meters_advanced_along_centerline"][i - 1]
-            ms_elapsed = config_copy.ms_per_action if (i < n_frames - 1 or ("race_time" not in rollout_results)) else rollout_results["race_time"] - (n_frames - 2) * config_copy.ms_per_action
-
-            # Calculate reward
-            rewards[i] = (
-                config_copy.constant_reward_per_ms * ms_elapsed
-                + config_copy.reward_per_m_advanced_along_centerline * meters_advanced
+            # Check if we should continue training
+            should_train = (
+                    len(buffer) >= min_episodes_to_start and
+                    accumulated_stats["cumul_number_single_memories_used"] <=
+                    accumulated_stats["cumul_number_single_memories_should_have_been_used"]
             )
 
-        # Check if we have explicit "done" flags, otherwise assume only the last state is terminal
-        dones = rollout_results.get("dones", np.zeros(n_frames, dtype=bool))
-        if not np.any(dones) and n_frames > 0:
-            dones[-1] = True  # Mark last state as terminal if no explicit dones
-            
-        # Create gammas with 0 for terminal states
-        current_gamma = utilities.from_linear_schedule(config_copy.gamma_schedule, accumulated_stats["cumul_number_frames_played"])
-        gammas = np.ones(n_frames) * current_gamma
-        gammas[dones] = 0.0  # Zero out gamma for terminal states
-        
-        # Prepare episode data for LSTM buffer
-        episode = {
-            "state_imgs": rollout_results["frames"],         # list of (1, H, W)
-            "state_floats": rollout_results["state_float"],  # list of (float_input_dim,)
-            "actions": rollout_results["actions"],           # list of ints
-            "rewards": rewards,                              # list of floats
-            "next_state_imgs": rollout_results.get("next_frames", rollout_results["frames"][1:] + [rollout_results["frames"][-1]]),
-            "next_state_floats": rollout_results.get("next_state_float", rollout_results["state_float"][1:] + [rollout_results["state_float"][-1]]),
-            "gammas": gammas,                                # list of floats with 0 for terminal states
-            "dones": dones.astype(int)                       # Store done flags for use by replay buffer/sampler
-        }
-        
-        # Check if episode is too large for buffer
-        if n_frames > buffer.capacity:
-            print(f"WARNING: Episode length ({n_frames}) exceeds buffer capacity ({buffer.capacity}). Trimming episode.")
-            # Trim the episode to fit in buffer if needed
-            max_frames = buffer.capacity - 1  # Leave room for buffer overhead
-            
-            # Trim all episode components
-            for key in episode:
-                if isinstance(episode[key], list):
-                    episode[key] = episode[key][:max_frames]
-                elif isinstance(episode[key], np.ndarray):
-                    episode[key] = episode[key][:max_frames]
-                    
-            print(f"  Episode trimmed to {max_frames} frames")
-            n_frames = max_frames  # Update n_frames to reflect the new size
-        
-        # Add episode to buffer
-        buffer.add_episode(episode)
-        print(f"  Added episode to replay buffer. Buffer size: {len(buffer)} / {buffer.capacity}")
-        
-        # Only train if we have enough data
-        if len(buffer) < lstm_config_copy.lstm_batch_size:
-            print(f"  Not enough data in buffer. Waiting for buffer size >= batch size ({config_copy.batch_size})")
-            continue
-            
-        # Sample a batch of sequences from the buffer
-        batch = buffer.sample_batch(lstm_config_copy.lstm_batch_size)
-        print(f"  Sampled batch of {lstm_config_copy.lstm_batch_size} sequences from buffer for training")
-        
-        # Move batch to device
-        state_img_seq = batch["state_imgs"].to("cuda")       # (batch, seq_len, 1, H, W)
-        state_float_seq = batch["state_floats"].to("cuda")   # (batch, seq_len, float_input_dim)
-        actions_seq = batch["actions"].to("cuda").long()     # (batch, seq_len)
-        rewards_seq = batch["rewards"].to("cuda")            # (batch, seq_len)
-        next_state_img_seq = batch["next_state_imgs"].to("cuda")  # (batch, seq_len, 1, H, W)
-        next_state_float_seq = batch["next_state_floats"].to("cuda")  # (batch, seq_len, float_input_dim)
-        gammas_seq = batch["gammas"].to("cuda")              # (batch, seq_len)
-        
-        # Extract prioritized replay specific components if present
-        weights = batch.get("weights", None)
-        indices = batch.get("indices", None)
-        
-        if weights is not None:
-            weights = weights.to("cuda")
+        # Save to files - now include the step counter
+        accumulated_stats["training_step"] = step
+        utilities.save_checkpoint(save_dir, online_network, target_network, optimizer, scaler, accumulated_stats)
 
-        # Forward pass
-        with torch.cuda.amp.autocast():
-            # Initialize hidden states for both networks
-            batch_size = state_img_seq.size(0)
-            h_0 = torch.zeros(lstm_config_copy.lstm_num_layers, batch_size, lstm_config_copy.lstm_hidden_dim).to("cuda")
-            c_0 = torch.zeros(lstm_config_copy.lstm_num_layers, batch_size, lstm_config_copy.lstm_hidden_dim).to("cuda")
-            hidden_online = (h_0, c_0)
-            hidden_target = (h_0.clone(), c_0.clone())
-            
-            # Process sequences through online network, maintaining hidden state properly
-            q_values_list = []
-            
-            # Process each timestep in the sequence while maintaining hidden states
-            for t in range(state_img_seq.size(1)):  # iterate through sequence length
-                # Get current timestep data
-                curr_state_img = state_img_seq[:, t]  # [batch_size, 1, H, W]
-                curr_state_float = state_float_seq[:, t]  # [batch_size, float_dim]
-                
-                # Forward pass for this timestep
-                q_t, hidden_online = online_network(curr_state_img, curr_state_float, hidden_online)
-                q_values_list.append(q_t)
-            
-            # Stack the outputs to get the full sequence output
-            q_values = torch.stack(q_values_list, dim=1)  # [batch_size, seq_len, n_actions]
-            
-            with torch.no_grad():
-                if use_double_q:
-                    # Double Q-learning implementation
-                    
-                    # First, get next state Q-values from online network for action selection
-                    q_next_online_list = []
-                    hidden_online_next = (h_0.clone(), c_0.clone())  # Fresh hidden state for next states
-                    
-                    for t in range(next_state_img_seq.size(1)):
-                        curr_next_state_img = next_state_img_seq[:, t]
-                        curr_next_state_float = next_state_float_seq[:, t]
-                        
-                        q_next_online_t, hidden_online_next = online_network(
-                            curr_next_state_img, curr_next_state_float, hidden_online_next)
-                        q_next_online_list.append(q_next_online_t)
-                    
-                    # Stack to get full sequence output from online network for next states
-                    q_next_online = torch.stack(q_next_online_list, dim=1)
-                    
-                    # Select actions using online network (argmax)
-                    next_actions = q_next_online.max(dim=2)[1].unsqueeze(2)  # [batch_size, seq_len, 1]
-                    
-                    # Process sequences through target network for evaluation
-                    q_next_list = []
-                    
-                    for t in range(next_state_img_seq.size(1)):
-                        curr_next_state_img = next_state_img_seq[:, t]
-                        curr_next_state_float = next_state_float_seq[:, t]
-                        
-                        q_next_t, hidden_target = target_network(
-                            curr_next_state_img, curr_next_state_float, hidden_target)
-                        q_next_list.append(q_next_t)
-                    
-                    # Stack to get full sequence output from target network
-                    q_next = torch.stack(q_next_list, dim=1)
-                    
-                    # Gather Q-values for the actions selected by online network
-                    q_next_selected = q_next.gather(2, next_actions).squeeze(2)
-                    
-                    # Apply gamma only to non-terminal states
-                    dones_seq = batch.get("dones", torch.zeros_like(rewards_seq)).to("cuda")
-                    future_rewards = gammas_seq * q_next_selected * (1.0 - dones_seq)
-                    targets = rewards_seq + future_rewards
-                else:
-                    # Standard Q-learning implementation (original code)
-                    # Process sequences through target network, maintaining hidden state
-                    q_next_list = []
-                    
-                    for t in range(next_state_img_seq.size(1)):
-                        curr_next_state_img = next_state_img_seq[:, t]
-                        curr_next_state_float = next_state_float_seq[:, t]
-                        
-                        q_next_t, hidden_target = target_network(
-                            curr_next_state_img, curr_next_state_float, hidden_target)
-                        q_next_list.append(q_next_t)
-                    
-                    q_next = torch.stack(q_next_list, dim=1)
-                    max_next_q = q_next.max(dim=2)[0]
-                    
-                    # Apply gamma only to non-terminal states
-                    dones_seq = batch.get("dones", torch.zeros_like(rewards_seq)).to("cuda")
-                    future_rewards = gammas_seq * max_next_q * (1.0 - dones_seq)
-                    targets = rewards_seq + future_rewards
+        # ===============================================
+        #   Periodic checkpoint and stat logging
+        # ===============================================
+        if time.perf_counter() - time_last_save >= save_frequency_s:
+            accumulated_stats["cumul_training_hours"] += (time.perf_counter() - time_last_save) / 3600
+            time_since_last_save = time.perf_counter() - time_last_save
 
-            # Get done flags if available
-            dones_seq = batch.get("dones", torch.zeros_like(rewards_seq)).to("cuda")
-            
-            # Calculate TD errors for loss and priority updates
-            q_selected = q_values.gather(2, actions_seq.unsqueeze(2)).squeeze(2)
-            td_errors = targets - q_selected
-            
-            # Standard DQN loss calculation
-            if weights is not None:
-                # Apply importance sampling weights for prioritized replay
-                loss = (td_errors.pow(2) * weights.unsqueeze(1)).mean()
-            else:
-                loss = td_errors.pow(2).mean()
-        
-        # Check for numerical issues in tensors
-        has_numerical_issues = False
-        has_numerical_issues |= check_tensor_for_issues(q_values, "q_values")
-        has_numerical_issues |= check_tensor_for_issues(q_next, "q_next")
-        
-        if use_double_q:
-            has_numerical_issues |= check_tensor_for_issues(q_next_online, "q_next_online")
-            has_numerical_issues |= check_tensor_for_issues(q_next_selected, "q_next_selected")
-        else:
-            has_numerical_issues |= check_tensor_for_issues(max_next_q, "max_next_q")
-            
-        has_numerical_issues |= check_tensor_for_issues(targets, "targets")
-        has_numerical_issues |= check_tensor_for_issues(q_selected, "q_selected")
-        has_numerical_issues |= check_tensor_for_issues(td_errors, "td_errors")
-        has_numerical_issues |= check_tensor_for_issues(loss, "loss")
+            # Collect statistics
+            training_params = {
+                "gamma": gamma,
+                "learning_rate": learning_rate,
+                "weight_decay": weight_decay
+            }
 
-        # Print training progress and stats
-        print(f"  Training step {step}")
-        print(f"    Loss: {loss.item():.6f}")
-        print(f"    Q value mean/max/min: {q_values.mean().item():.3f} / {q_values.max().item():.3f} / {q_values.min().item():.3f}")
-        
-        if use_double_q:
-            print(f"    Double Q-learning: Target net selected Q mean: {q_next_selected.mean().item():.3f}")
-        else:
-            print(f"    Standard Q-learning: Target net max_next_q mean: {max_next_q.mean().item():.3f}")
-            
-        print(f"    Buffer size: {len(buffer)}")
-        if step % 50 == 0:
-            # Show some weights stats for debugging if desired
-            first_layer = next(online_network.parameters())
-            print(f"    First param tensor (mean/std/min/max): {first_layer.mean().item():.3f} / {first_layer.std().item():.3f} / {first_layer.min().item():.3f} / {first_layer.max().item():.3f}")
-
-        # Skip optimization if numerical issues detected
-        if has_numerical_issues:
-            print("  WARNING: Numerical issues detected. Skipping optimization for this batch.")
-            tensorboard_writer.add_scalar('errors/numerical_issues', 1, step)
-        else:
-            # Optimization step
-            optimizer.zero_grad(set_to_none=True)
-            scaler.scale(loss).backward()
-            scaler.unscale_(optimizer)
-            
-            # Check for gradient issues after unscaling
-            grad_has_issues = False
-            for name, param in online_network.named_parameters():
-                if param.grad is not None:
-                    if check_tensor_for_issues(param.grad, f"{name}.grad"):
-                        grad_has_issues = True
-                        break
-            
-            if grad_has_issues:
-                print("  WARNING: Numerical issues in gradients. Skipping parameter update.")
-                tensorboard_writer.add_scalar('errors/gradient_issues', 1, step)
-            else:
-                # Apply gradient clipping and update parameters
-                torch.nn.utils.clip_grad_norm_(online_network.parameters(), config_copy.clip_grad_norm)
-                scaler.step(optimizer)
-                scaler.update()
-        
-        # Update priorities in buffer if using prioritized replay
-        if indices is not None:
-            with torch.no_grad():
-                # Use absolute TD errors as priorities
-                new_priorities = td_errors.abs().mean(dim=1).cpu().numpy()  # Mean across sequence dimension
-                buffer.update_priorities(indices, new_priorities)
-        
-        # Update step counter
-        step += 1
-        cumul_number_batches_done += 1  # Increment batch counter
-        with shared_steps.get_lock():
-            shared_steps.value += 1
-        print(f"    Shared steps (global): {shared_steps.value}")
-        
-        # Periodically update target network
-        if step - last_target_update >= target_update_frequency:
-            target_network.load_state_dict(online_network.state_dict())
-            last_target_update = step
-            print(f"    Target network updated at step {step}")
-            
-        # Periodically update shared network
-        if step - last_shared_update >= network_update_frequency:
-            with shared_network_lock:
-                uncompiled_shared_network.load_state_dict(uncompiled_online_network.state_dict())
-            last_shared_update = step
-            print(f"    Shared uncompiled network updated at step {step}")
-            
-        # Track episode rewards for performance-based saving and LR scheduling
-        if end_race_stats and "total_reward" in end_race_stats:
-            episode_rewards.append(end_race_stats["total_reward"])
-            # No need to manually pop since deque handles max length
-            
-            # Update performance metrics for learning rate scheduling
-            if len(episode_rewards) >= 10:
-                current_avg_reward = np.mean(episode_rewards)
-                performance_metric_history.append(current_avg_reward)
-                
-                # Calculate a stable performance metric by averaging recent performance
-                if len(performance_metric_history) >= 10:
-                    avg_performance = np.mean(performance_metric_history)
-                    
-                    # Update learning rate based on performance
-                    old_lr = optimizer.param_groups[0]['lr']
-                    lr_scheduler.step(avg_performance)
-                    new_lr = optimizer.param_groups[0]['lr']
-                    
-                    # Log if learning rate changed
-                    if old_lr != new_lr:
-                        print(f"    Learning rate adjusted: {old_lr:.6f} -> {new_lr:.6f}")
-                    
-                    # Log current learning rate
-                    tensorboard_writer.add_scalar('train/learning_rate', new_lr, step)
-        
-        # Conditional model saving logic
-        should_save = False
-        current_avg_reward = None
-        save_reason = ""
-        
-        # Option 1: Save periodically based on frequency
-        if step - last_save >= save_frequency:
-            should_save = True
-            save_reason = f"periodic checkpoint at step {step}"
-        
-        # Option 2: Save if performance has improved significantly
-        if len(episode_rewards) >= 10:  # Need at least 10 episodes to calculate meaningful average
-            current_avg_reward = np.mean(episode_rewards)
-            
-            # Save if we have a new best performance (improvement of at least threshold %)
-            if current_avg_reward > best_avg_reward * reward_improvement_threshold:
-                best_avg_reward = current_avg_reward
-                should_save = True
-                save_reason = f"performance improved! New best avg reward: {current_avg_reward:.2f}"
-                
-                # Also save a special "best" checkpoint
-                best_checkpoint_path = save_dir / "lstm_best_model.pt"
-                torch.save({
-                    'online_network': online_network.state_dict(),
-                    'target_network': target_network.state_dict(),
-                    'optimizer': optimizer.state_dict(),
-                    'scaler': scaler.state_dict(),
-                    'step': step,
-                    'accumulated_stats': accumulated_stats,
-                    'avg_reward': current_avg_reward
-                }, best_checkpoint_path)
-                print(f"    Saved new best model with avg reward {current_avg_reward:.2f}")
-        
-        # Save if conditions are met
-        if should_save:
-            # Save weights
-            torch.save(online_network.state_dict(), save_dir / "lstm_weights1.torch")
-            torch.save(target_network.state_dict(), save_dir / "lstm_weights2.torch")
-            torch.save(optimizer.state_dict(), save_dir / "lstm_optimizer.torch")
-            torch.save(scaler.state_dict(), save_dir / "lstm_scaler.torch")
-            torch.save(lr_scheduler.state_dict(), save_dir / "lstm_scheduler.torch")
-            
-            # Also save a versioned checkpoint for reference
-            save_path = save_dir / f"lstm_model_step_{step}.pt"
-            torch.save({
-                'online_network': online_network.state_dict(),
-                'target_network': target_network.state_dict(),
-                'optimizer': optimizer.state_dict(),
-                'scaler': scaler.state_dict(),
-                'step': step,
-                'accumulated_stats': accumulated_stats,
-                'avg_reward': current_avg_reward if current_avg_reward is not None else None
-            }, save_path)
-            
-            # Save stats
-            accumulated_stats["cumul_number_frames_played"] = shared_steps.value
-            accumulated_stats["cumul_number_batches_done"] = cumul_number_batches_done
-            accumulated_stats["last_step"] = step
-            accumulated_stats["best_avg_reward"] = best_avg_reward
-            accumulated_stats["best_validation_reward"] = best_validation_reward
-            accumulated_stats["episode_rewards"] = list(episode_rewards)
-            accumulated_stats["performance_metric_history"] = list(performance_metric_history)
-            accumulated_stats["current_learning_rate"] = optimizer.param_groups[0]['lr']
-            
-            # Save both individual files and the combined checkpoint
-            joblib.dump(accumulated_stats, save_dir / "lstm_accumulated_stats.joblib")
-            
-            last_save = step
-            print(f"    Model checkpoint and stats saved at step {step} - Reason: {save_reason}")
-            
-        # Log stats to tensorboard
-        tensorboard_writer.add_scalar('train/loss', loss.item(), step)
-        tensorboard_writer.add_scalar('train/q_values_mean', q_values.mean().item(), step)
-        tensorboard_writer.add_scalar('train/q_values_max', q_values.max().item(), step)
-        tensorboard_writer.add_scalar('train/q_values_min', q_values.min().item(), step)
-        tensorboard_writer.add_scalar('train/buffer_size', len(buffer), step)
-        
-        # Log different metrics based on whether we're using Double Q or not
-        if use_double_q:
-            tensorboard_writer.add_scalar('train/next_q_selected', q_next_selected.mean().item(), step)
-            tensorboard_writer.add_scalar('train/double_q_action_diff', 
-                                         (q_next.max(dim=2)[1] != next_actions.squeeze(2)).float().mean().item(), step)
-        else:
-            tensorboard_writer.add_scalar('train/max_next_q', max_next_q.mean().item(), step)
-            
-        tensorboard_writer.add_scalar('train/steps_since_target_update', step - last_target_update, step)
-        
-        # Log numerical stability metrics
-        if not hasattr(accumulated_stats, "numerical_issues_count"):
-            accumulated_stats["numerical_issues_count"] = 0
-        if not hasattr(accumulated_stats, "gradient_issues_count"):
-            accumulated_stats["gradient_issues_count"] = 0
-            
-        if has_numerical_issues:
-            accumulated_stats["numerical_issues_count"] += 1
-            tensorboard_writer.add_scalar('errors/numerical_issues_cumulative', 
-                                         accumulated_stats["numerical_issues_count"], step)
-        
-        if 'grad_has_issues' in locals() and grad_has_issues:
-            accumulated_stats["gradient_issues_count"] += 1
-            tensorboard_writer.add_scalar('errors/gradient_issues_cumulative', 
-                                         accumulated_stats["gradient_issues_count"], step)
-        
-        # Log prioritized replay specific metrics if enabled
-        if hasattr(buffer, "use_prioritized") and buffer.use_prioritized:
-            if hasattr(buffer, "beta"):
-                tensorboard_writer.add_scalar('train/priority_beta', buffer.beta, step)
-            if weights is not None:
-                tensorboard_writer.add_scalar('train/priority_weights_mean', weights.mean().item(), step)
-                tensorboard_writer.add_scalar('train/priority_weights_max', weights.max().item(), step)
-
-        # Log network parameters and gradients
-        total_params = 0
-        for name, param in online_network.named_parameters():
-            num_param = param.numel()
-            total_params += num_param
-            tensorboard_writer.add_scalar(f"agent_params/{name.replace('.', '_')}_mean", param.data.mean().item(), step)
-            tensorboard_writer.add_scalar(f"agent_params/{name.replace('.', '_')}_std", param.data.std().item(), step)
-            tensorboard_writer.add_scalar(f"agent_params/{name.replace('.', '_')}_min", param.data.min().item(), step)
-            tensorboard_writer.add_scalar(f"agent_params/{name.replace('.', '_')}_max", param.data.max().item(), step)
-            if param.grad is not None:
-                tensorboard_writer.add_scalar(f"agent_grads/{name.replace('.', '_')}_grad_mean", param.grad.mean().item(), step)
-                tensorboard_writer.add_scalar(f"agent_grads/{name.replace('.', '_')}_grad_std", param.grad.std().item(), step)
-        tensorboard_writer.add_scalar("agent_params/total_param_count", total_params, step)
-        # Optimizer state log (LR etc.)
-        for i, group in enumerate(optimizer.param_groups):
-            tensorboard_writer.add_scalar(f"optimizer/group_{i}_lr", group['lr'], step)
-            
-        # Log performance metrics used for LR scheduling
-        if len(performance_metric_history) > 0:
-            tensorboard_writer.add_scalar('performance/lr_scheduling_metric', 
-                                         np.mean(performance_metric_history), step)
-
-        # Log end race stats if available
-        if end_race_stats:
-            for k, v in end_race_stats.items():
-                if isinstance(v, (int, float)):
-                    tensorboard_writer.add_scalar(f'race/{k}', v, step)
-                    print(f"    End race stat: {k} = {v}")
-            
-            # Log average reward over last episodes
-            if len(episode_rewards) > 0:
-                avg_reward = np.mean(episode_rewards)
-                tensorboard_writer.add_scalar('performance/avg_reward_last_episodes', avg_reward, step)
-                tensorboard_writer.add_scalar('performance/best_avg_reward', best_avg_reward, step)
-
-        # Log wait time stats
-        tensorboard_writer.add_scalar('timing/wait_time_total', wait_time_total, step)
-        
-        # Run validation on held-out maps if it's time
-        if validation_maps and step % validation_frequency == 0:
-            validate_on_held_out_maps(
-                online_network=online_network,
-                step=step,
-                validation_maps=validation_maps,
-                tensorboard_writer=tensorboard_writer,
-                save_dir=save_dir,
-                accumulated_stats=accumulated_stats,
-                best_validation_reward=best_validation_reward
+            step_stats = collect_periodic_stats(
+                accumulated_stats,
+                loss_history,
+                train_on_batch_duration_history,
+                grad_norm_history,
+                layer_grad_norm_history,
+                buffer,  # Pass LSTM buffer
+                training_params,
+                time_waited_for_workers_since_last_tensorboard_write,
+                time_training_since_last_tensorboard_write,
+                time_testing_since_last_tensorboard_write,
+                time_since_last_save,
+                transitions_learned_last_save
             )
+
+            # Reset timing counters
+            time_waited_for_workers_since_last_tensorboard_write = 0
+            time_training_since_last_tensorboard_write = 0
+            time_testing_since_last_tensorboard_write = 0
+            time_last_save = time.perf_counter()
+            transitions_learned_last_save = accumulated_stats["cumul_number_single_memories_used"]
+
+            # Log detailed stats to TensorBoard
+            previous_alltime_min = log_detailed_tensorboard_stats(
+                tensorboard_writer,
+                online_network,
+                optimizer,
+                accumulated_stats,
+                step_stats,
+                previous_alltime_min,
+                step
+            )
+
+            # Reset history arrays
+            loss_history = []
+            train_on_batch_duration_history = []
+            grad_norm_history = []
+            layer_grad_norm_history = defaultdict(list)
+
+            # Save checkpoint - now include the step counter
+            accumulated_stats["training_step"] = step
+            save_checkpoint(save_dir, online_network, target_network, optimizer, scaler, accumulated_stats)
+
+            print(f"LSTM Buffer stats: {len(buffer)} episodes stored")

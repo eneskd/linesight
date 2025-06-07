@@ -31,7 +31,6 @@ class LSTMAgent(nn.Module):
         self,
         float_inputs_dim: int,
         img_shape: Tuple[int, int, int],  # (C, H, W)
-        cnn_out_dim: int,
         lstm_hidden_dim: int,
         lstm_num_layers: int,
         mlp_hidden_dims: Tuple[int, ...],
@@ -140,7 +139,6 @@ def make_untrained_lstm_agent(
     agent = LSTMAgent(
         float_inputs_dim=config_copy.float_input_dim,
         img_shape=(1, config_copy.H_downsized, config_copy.W_downsized),
-        cnn_out_dim=lstm_config_copy.lstm_cnn_out_dim,
         lstm_hidden_dim=lstm_config_copy.lstm_hidden_dim,
         lstm_num_layers=lstm_config_copy.lstm_num_layers,
         mlp_hidden_dims=lstm_config_copy.get_lstm_mlp_hidden_dims(),

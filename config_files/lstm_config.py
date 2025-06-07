@@ -1,5 +1,8 @@
 # LSTM Agent Hyperparameters and Architecture
 
+# Import required for accessing general config
+from config_files import config_copy
+
 # CNN head output dimension (computed automatically in agent, but you can set for reference)
 lstm_cnn_out_dim = 256
 
