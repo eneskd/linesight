@@ -28,7 +28,7 @@ from config_files.user_config import *
 W_downsized = 160
 H_downsized = 120
 
-run_name = "lstm_test_002"
+run_name = "lstm_test_003"
 running_speed = 80
 
 agent_type = "lstm"  # "mlp", "iqn", "lstm"

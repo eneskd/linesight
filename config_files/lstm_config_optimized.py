@@ -26,20 +26,20 @@ lstm_activation = "gelu"
 # Dropout rate - moderate dropout for regularization
 lstm_dropout = 0.1
 
-gamma = 0.99
+gamma = 0.995
 
 # ========================================
 # Training Optimization Parameters
 # ========================================
 
 # Batch size - larger batches for better gradient estimates
-lstm_batch_size = 16
+lstm_batch_size = 32
 
 # Sequence length - longer sequences for better temporal modeling
-lstm_seq_len = 8
+lstm_seq_len = 16
 
 # Gradient accumulation steps - simulate larger batch sizes
-gradient_accumulation_steps = 2
+gradient_accumulation_steps = 1
 
 # Optimizer choice - AdamW often works better than RAdam for transformers
 optimizer = "AdamW"
@@ -73,7 +73,7 @@ use_mixed_precision = False
 # ========================================
 
 # Replay buffer capacity - larger buffer for better sample diversity
-replay_buffer_capacity = 100000
+replay_buffer_capacity = 200000
 
 # Prioritized experience replay
 use_prioritized_replay = True
@@ -99,7 +99,7 @@ target_update_tau = 0.005
 # ========================================
 
 # Maximum training steps per iteration to prevent blocking
-max_training_steps_per_iteration = 20
+max_training_steps_per_iteration = 15
 
 # Checkpoint and logging frequency
 save_frequency_s = 300  # 5 minutes
@@ -149,7 +149,7 @@ predict_reward = False
 auxiliary_loss_weight = 0.1
 
 log_frequency = 1
-tensorboard_log_frequency = 10
+tensorboard_log_frequency = 5
 
 # ========================================
 # Hyperparameter Schedules
