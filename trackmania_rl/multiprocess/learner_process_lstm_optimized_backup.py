@@ -77,6 +77,8 @@ class OptimizedLSTMTrainer:
         self.forward_times = deque(maxlen=100)
         self.backward_times = deque(maxlen=100)
         
+        # Gradient tracking
+        self.gradients_unscaled = False
         
         # Memory monitoring
         import gc
@@ -190,6 +192,7 @@ class OptimizedLSTMTrainer:
         # Zero gradients only when not accumulating
         if step % self.use_gradient_accumulation == 0:
             self.optimizer.zero_grad(set_to_none=True)
+            self.gradients_unscaled = False  # Reset unscale state
         
         # Forward pass with mixed precision (only for network and target computation)
         with torch.amp.autocast(device_type="cuda", dtype=torch.float16, enabled=self.use_mixed_precision):
@@ -229,8 +232,10 @@ class OptimizedLSTMTrainer:
         
         # Update weights only after accumulating gradients
         if (step + 1) % self.use_gradient_accumulation == 0:
-            # Unscale gradients for clipping
-            self.scaler.unscale_(self.optimizer)
+            # Unscale gradients for clipping (only if not already unscaled)
+            if not self.gradients_unscaled:
+                self.scaler.unscale_(self.optimizer)
+                self.gradients_unscaled = True
             
             # Advanced gradient clipping
             grad_norm = self.advanced_gradient_clipping()
@@ -238,21 +243,39 @@ class OptimizedLSTMTrainer:
             # Optimizer step
             self.scaler.step(self.optimizer)
             self.scaler.update()
+            self.gradients_unscaled = False  # Reset after optimizer step
         else:
-            # For gradient accumulation steps, compute norm on scaled gradients
-            # and then divide by the scale factor to get the true norm
-            current_scale = self.scaler.get_scale()
-            
-            # Compute norm on scaled gradients
-            total_norm = 0.0
-            for param in self.online_network.parameters():
-                if param.grad is not None:
-                    param_norm = param.grad.data.norm(2)
-                    total_norm += param_norm.item() ** 2
-            scaled_grad_norm = total_norm ** 0.5
-            
-            # Unscale the norm to get the true gradient norm
-            grad_norm = scaled_grad_norm / current_scale if current_scale > 0 else 0.0
+            # For gradient accumulation steps, we need to unscale gradients temporarily
+            # to get the true gradient norm, then restore the scaled state
+            if not self.gradients_unscaled:
+                # Store the current scale for restoration
+                current_scale = self.scaler.get_scale()
+                
+                # Temporarily unscale gradients to compute true norm
+                self.scaler.unscale_(self.optimizer)
+                self.gradients_unscaled = True
+                
+                # Compute the true gradient norm
+                total_norm = 0.0
+                for param in self.online_network.parameters():
+                    if param.grad is not None:
+                        param_norm = param.grad.data.norm(2)
+                        total_norm += param_norm.item() ** 2
+                grad_norm = total_norm ** 0.5
+                
+                # Restore scaled gradients by scaling them back
+                for param in self.online_network.parameters():
+                    if param.grad is not None:
+                        param.grad.data.mul_(current_scale)
+                self.gradients_unscaled = False
+            else:
+                # Gradients already unscaled, just compute norm
+                total_norm = 0.0
+                for param in self.online_network.parameters():
+                    if param.grad is not None:
+                        param_norm = param.grad.data.norm(2)
+                        total_norm += param_norm.item() ** 2
+                grad_norm = total_norm ** 0.5
         
         backward_time = time.perf_counter() - backward_start
         self.backward_times.append(backward_time)

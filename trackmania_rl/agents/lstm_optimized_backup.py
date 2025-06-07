@@ -205,8 +205,6 @@ class OptimizedLSTMAgent(nn.Module):
         # Positional encoding
         if use_positional_encoding:
             self.pos_encoding = PositionalEncoding(lstm_hidden_dim)
-        else:
-            self.pos_encoding = None
         
         # LSTM layers with improved configuration
         self.lstm = nn.LSTM(
@@ -221,8 +219,6 @@ class OptimizedLSTMAgent(nn.Module):
         # Layer normalization
         if use_layer_norm:
             self.layer_norm = nn.LayerNorm(lstm_hidden_dim)
-        else:
-            self.layer_norm = None
         
         # Attention mechanism
         if use_attention:
@@ -233,11 +229,6 @@ class OptimizedLSTMAgent(nn.Module):
             )
             if use_layer_norm:
                 self.attn_norm = nn.LayerNorm(lstm_hidden_dim)
-            else:
-                self.attn_norm = None
-        else:
-            self.attention = None
-            self.attn_norm = None
         
         # Enhanced MLP head with residual connections
         mlp_layers = []
@@ -268,12 +259,10 @@ class OptimizedLSTMAgent(nn.Module):
                     nn.init.orthogonal_(param)
                 elif 'conv' in name:
                     # CNN weight initialization
-                    if param.dim() >= 2:
-                        nn.init.kaiming_normal_(param, mode='fan_out', nonlinearity='relu')
+                    nn.init.kaiming_normal_(param, mode='fan_out', nonlinearity='relu')
                 else:
                     # Linear layer initialization
-                    if param.dim() >= 2:
-                        nn.init.xavier_uniform_(param)
+                    nn.init.xavier_uniform_(param)
             elif 'bias' in name:
                 nn.init.constant_(param, 0)
     
@@ -320,19 +309,19 @@ class OptimizedLSTMAgent(nn.Module):
         features = self.input_projection(features)
         
         # Add positional encoding
-        if self.use_positional_encoding and self.pos_encoding is not None:
+        if self.use_positional_encoding:
             features = self.pos_encoding(features.transpose(0, 1)).transpose(0, 1)
         
         # LSTM processing
         lstm_out, new_hidden = self.lstm(features, hidden)
         
         # Apply layer normalization
-        if self.use_layer_norm and self.layer_norm is not None:
+        if self.use_layer_norm:
             lstm_out = self.layer_norm(lstm_out)
         
         # Apply attention mechanism
         attention_weights = None
-        if self.use_attention and self.attention is not None:
+        if self.use_attention:
             attn_out, attention_weights = self.attention(lstm_out, lstm_out, lstm_out)
             
             # Residual connection
@@ -342,7 +331,7 @@ class OptimizedLSTMAgent(nn.Module):
                 lstm_out = attn_out
             
             # Layer normalization after attention
-            if self.use_layer_norm and self.attn_norm is not None:
+            if self.use_layer_norm:
                 lstm_out = self.attn_norm(lstm_out)
         
         # MLP head
@@ -351,7 +340,7 @@ class OptimizedLSTMAgent(nn.Module):
         if return_attention:
             return q_values, new_hidden, attention_weights
         else:
-            return q_values, new_hidden, None
+            return q_values, new_hidden
     
     def get_feature_representations(self, img_seq, float_inputs_seq):
         """Get intermediate feature representations for analysis."""

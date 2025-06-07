@@ -16,14 +16,6 @@ from config_files import lstm_config_optimized_copy as lstm_config_copy
 from trackmania_rl import utilities
 from trackmania_rl.agents.lstm_optimized import make_optimized_lstm_agent as make_untrained_lstm_agent
 
-
-def _detach_hidden_state(self, hidden):
-    """Properly detach hidden state from computation graph"""
-    if hidden is None:
-        return None
-    h, c = hidden
-    return (h.detach().clone(), c.detach().clone())
-
 class LSTMInferer:
     """LSTM-based inferer that maintains hidden states across timesteps"""
 
@@ -47,6 +39,13 @@ class LSTMInferer:
         self.hidden_state = None
         self.img_history = []
         self.float_history = []
+
+    def _detach_hidden_state(self, hidden):
+        """Properly detach hidden state from computation graph"""
+        if hidden is None:
+            return None
+        h, c = hidden
+        return (h.detach().clone(), c.detach().clone())
 
     def preprocess_img(self, img):
         """Standardize image input to be (1, H, W)"""
@@ -125,10 +124,10 @@ class LSTMInferer:
             img_seq, float_seq = self.get_sequence_tensors()
             
             # Forward pass through LSTM
-            q_values, new_hidden = self.network(img_seq, float_seq, self.hidden_state)
+            q_values, new_hidden, _ = self.network(img_seq, float_seq, self.hidden_state)
             
             # Update hidden state for next timestep
-            self.hidden_state = _detach_hidden_state(self, new_hidden)
+            self.hidden_state = self._detach_hidden_state(new_hidden)
             
             # Get Q-values for the last timestep (most recent observation)
             last_q_values = q_values[0, -1, :]  # (n_actions,)

@@ -79,14 +79,17 @@ if getattr(config_copy, "agent_type", "iqn").lower() == "mlp":
     from trackmania_rl.agents.mlp import make_untrained_mlp_agent as make_untrained_agent
     from trackmania_rl.multiprocess.learner_process_mlp import learner_process_fn
     from trackmania_rl.multiprocess.collector_process_mlp import collector_process_fn
+    print("Using MLP agent")
 elif getattr(config_copy, "agent_type", "iqn").lower()  == "lstm":
     from trackmania_rl.agents.lstm_optimized import make_optimized_lstm_agent as make_untrained_agent
     from trackmania_rl.multiprocess.learner_process_lstm_optimized import learner_process_fn
     from trackmania_rl.multiprocess.collector_process_lstm import collector_process_fn
+    print("Using LSTM agent")
 else:
     from trackmania_rl.agents.iqn import make_untrained_iqn_network as make_untrained_agent
     from trackmania_rl.multiprocess.learner_process_iqn import learner_process_fn
     from trackmania_rl.multiprocess.collector_process_iqn import collector_process_fn
+    print("Using IQN agent")
 
 
 # noinspection PyUnresolvedReferences

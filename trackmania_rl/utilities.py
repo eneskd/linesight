@@ -85,7 +85,10 @@ def soft_copy_param(target_link, source_link, tau):
 def custom_weight_decay(target_link, decay_factor):
     target_dict = target_link.state_dict()
     for k, target_value in target_dict.items():
-        target_value.mul_(decay_factor)
+        # Only apply weight decay to float-type parameters (weights and biases)
+        # Skip integer parameters like num_batches_tracked in BatchNorm layers
+        if target_value.dtype in [torch.float32, torch.float64, torch.float16]:
+            target_value.mul_(decay_factor)
 
 
 def from_exponential_schedule(schedule: List[Tuple[int, float]], current_step: int):

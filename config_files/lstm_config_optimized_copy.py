@@ -36,7 +36,7 @@ gamma = 0.99
 lstm_batch_size = 16
 
 # Sequence length - longer sequences for better temporal modeling
-lstm_seq_len = 16
+lstm_seq_len = 8
 
 # Gradient accumulation steps - simulate larger batch sizes
 gradient_accumulation_steps = 2
@@ -46,7 +46,7 @@ optimizer = "AdamW"
 weight_decay = 0.01
 
 # Learning rate schedule parameters
-initial_learning_rate = 3e-4
+initial_learning_rate = 5e-5
 lr_warmup_steps = 1000
 lr_decay_factor = 0.95
 
@@ -110,8 +110,8 @@ tensorboard_log_frequency = 10  # Every 10 steps
 # ========================================
 
 # Gradient clipping parameters
-max_grad_norm = 1.0
-max_grad_value = 0.5
+max_grad_norm = 0.5
+max_grad_value = 0.1
 
 # LSTM-specific regularization
 lstm_weight_decay_multiplier = 0.5  # Reduce weight decay for LSTM layers
@@ -148,7 +148,7 @@ predict_next_state = False
 predict_reward = False
 auxiliary_loss_weight = 0.1
 
-log_frequency = 5
+log_frequency = 1
 tensorboard_log_frequency = 10
 
 # ========================================
