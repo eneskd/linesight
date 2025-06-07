@@ -73,15 +73,53 @@ def save_checkpoint(save_dir, online_network, target_network, optimizer, scaler,
 
 
 
+def validate_checkpoint(checkpoint_path):
+    """Validate that a checkpoint file can be loaded without errors."""
+    try:
+        checkpoint = torch.load(checkpoint_path, weights_only=False)
+        # Check that all required keys exist
+        required_keys = ['online_network', 'target_network', 'optimizer', 'scaler', 'stats']
+        for key in required_keys:
+            if key not in checkpoint:
+                return False, f"Missing key: {key}"
+        return True, "Valid"
+    except Exception as e:
+        return False, str(e)
+
+
+def cleanup_corrupted_checkpoints(save_dir):
+    """Remove corrupted checkpoint files from the save directory."""
+    checkpoint_files = list(save_dir.glob("checkpoint_step_*.pt"))
+    corrupted_files = []
+    
+    for checkpoint_path in checkpoint_files:
+        is_valid, error_msg = validate_checkpoint(checkpoint_path)
+        if not is_valid:
+            print(f"Found corrupted checkpoint: {checkpoint_path} - {error_msg}")
+            try:
+                checkpoint_path.unlink()
+                corrupted_files.append(checkpoint_path)
+                print(f"Deleted corrupted checkpoint: {checkpoint_path}")
+            except Exception as delete_error:
+                print(f"Could not delete corrupted checkpoint {checkpoint_path}: {delete_error}")
+    
+    if corrupted_files:
+        print(f"Cleaned up {len(corrupted_files)} corrupted checkpoint files")
+    else:
+        print("No corrupted checkpoints found")
+    
+    return corrupted_files
+
+
 def load_checkpoint(save_dir, online_network, target_network, optimizer, scaler, accumulated_stats, shared_steps):
     """Load checkpoint if available."""
     try:
-        online_network.load_state_dict(torch.load(f=save_dir / "weights1.torch", weights_only=False))
-        target_network.load_state_dict(torch.load(f=save_dir / "weights2.torch", weights_only=False))
+        online_network.load_state_dict(torch.load(save_dir / "weights1.torch", weights_only=False))
+        target_network.load_state_dict(torch.load(save_dir / "weights2.torch", weights_only=False))
         print(" =====================     Learner weights loaded !     ============================")
         try:
-            optimizer.load_state_dict(torch.load(f=save_dir / "optimizer1.torch", weights_only=False))
-            scaler.load_state_dict(torch.load(f=save_dir / "scaler.torch", weights_only=False))
+            optimizer.load_state_dict(torch.load(save_dir / "optimizer1.torch", weights_only=False))
+            scaler.load_state_dict(torch.load(save_dir / "scaler.torch", weights_only=False))
             print(" =========================     Optimizer loaded !     ================================")
         except Exception as e:
             print(f" Could not load optimizer: {e}")
@@ -99,22 +137,35 @@ def load_checkpoint(save_dir, online_network, target_network, optimizer, scaler,
     # Try to load consolidated checkpoint
     checkpoint_files = list(save_dir.glob("checkpoint_step_*.pt"))
     if checkpoint_files:
-        latest_checkpoint = max(checkpoint_files, key=lambda p: int(p.stem.split('_')[-1]))
-        try:
-            checkpoint = torch.load(latest_checkpoint)
-            online_network.load_state_dict(checkpoint['online_network'])
-            target_network.load_state_dict(checkpoint['target_network'])
-            accumulated_stats.update(checkpoint['stats'])
-            optimizer.load_state_dict(checkpoint['optimizer'])
-            scaler.load_state_dict(checkpoint['scaler'])
-            shared_steps.value = accumulated_stats["cumul_number_frames_played"]
-            print(f" ===================== Loaded checkpoint from {latest_checkpoint} ============================")
-            print(
-                f" ===================== Resumed from step {accumulated_stats['cumul_number_frames_played']} ============================")
-            return True
-        except Exception as e:
-            print(f" Error loading checkpoint from {latest_checkpoint}: {e}")
-            return False
+        # Sort checkpoints by step number (newest first)
+        checkpoint_files.sort(key=lambda p: int(p.stem.split('_')[-1]), reverse=True)
+        
+        # Try loading checkpoints starting from the newest
+        for checkpoint_path in checkpoint_files:
+            try:
+                print(f" Attempting to load checkpoint: {checkpoint_path}")
+                checkpoint = torch.load(checkpoint_path, weights_only=False)
+                online_network.load_state_dict(checkpoint['online_network'])
+                target_network.load_state_dict(checkpoint['target_network'])
+                accumulated_stats.update(checkpoint['stats'])
+                optimizer.load_state_dict(checkpoint['optimizer'])
+                scaler.load_state_dict(checkpoint['scaler'])
+                shared_steps.value = accumulated_stats["cumul_number_frames_played"]
+                print(f" ===================== Loaded checkpoint from {checkpoint_path} ============================")
+                print(f" ===================== Resumed from step {accumulated_stats['cumul_number_frames_played']} ============================")
+                return True
+            except Exception as e:
+                print(f" Error loading checkpoint from {checkpoint_path}: {e}")
+                print(f" Checkpoint may be corrupted, trying next checkpoint...")
+                # If this checkpoint is corrupted, try to delete it to prevent future issues
+                try:
+                    checkpoint_path.unlink()
+                    print(f" Deleted corrupted checkpoint: {checkpoint_path}")
+                except Exception as delete_error:
+                    print(f" Could not delete corrupted checkpoint {checkpoint_path}: {delete_error}")
+                continue
+        
+        print(" All checkpoint files failed to load or were corrupted")
 
     return False
 

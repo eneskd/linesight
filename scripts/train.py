@@ -39,6 +39,10 @@ def copy_configuration_file():
         base_dir / "config_files" / "lstm_config.py",
         base_dir / "config_files" / "lstm_config_copy.py",
     )
+    shutil.copyfile(
+        base_dir / "config_files" / "lstm_config_optimized.py",
+        base_dir / "config_files" / "lstm_config_optimized_copy.py",
+    )
 
 
 if __name__ == "__main__":
@@ -64,6 +68,7 @@ from torch.multiprocessing import Lock
 from config_files import config_copy
 from config_files import mlp_config_copy
 from config_files import iqn_config_copy
+from config_files import lstm_config_optimized_copy
 
 import os
 os.environ["TF_ENABLE_ONEDNN_OPTS"] = "0"
@@ -75,8 +80,8 @@ if getattr(config_copy, "agent_type", "iqn").lower() == "mlp":
     from trackmania_rl.multiprocess.learner_process_mlp import learner_process_fn
     from trackmania_rl.multiprocess.collector_process_mlp import collector_process_fn
 elif getattr(config_copy, "agent_type", "iqn").lower()  == "lstm":
-    from trackmania_rl.agents.lstm import make_untrained_lstm_agent as make_untrained_agent
-    from trackmania_rl.multiprocess.learner_process_lstm import learner_process_fn
+    from trackmania_rl.agents.lstm_optimized import make_optimized_lstm_agent as make_untrained_agent
+    from trackmania_rl.multiprocess.learner_process_lstm_optimized import learner_process_fn
     from trackmania_rl.multiprocess.collector_process_lstm import collector_process_fn
 else:
     from trackmania_rl.agents.iqn import make_untrained_iqn_network as make_untrained_agent

@@ -114,6 +114,7 @@ class LSTMReplayBuffer:
                 - 'terminals': List of terminal flags
         """
         # Ensure all lists have the same length
+        self._validate_episode_data(episode_data)
         episode_length = len(episode_data['frames'])
         for key, data in episode_data.items():
             if len(data) != episode_length:
@@ -152,8 +153,14 @@ class LSTMReplayBuffer:
         Returns:
             Dictionary of tensors with shape (batch_size, seq_len, ...)
         """
-        return self.sample_batch_with_improved_strategy(batch_size)
-    
+
+        batch = self.sample_batch_with_improved_strategy(batch_size)
+        self._validate_tensor_shapes(batch)
+        return batch
+
+
+
+
     def sample_batch_with_improved_strategy(self, batch_size: int) -> Dict[str, torch.Tensor]:
         """
         Enhanced sampling that prioritizes important transitions and recent episodes.
@@ -180,7 +187,7 @@ class LSTMReplayBuffer:
             self.beta = min(1.0, self.beta + self.beta_annealing)
             
             # Calculate weights for importance sampling
-            weights = np.zeros(batch_size, dtype=np.float32)
+            weights = np.ones(batch_size, dtype=np.float32)
             
             # Sample from priority tree
             segment = self.tree.total() / batch_size
@@ -220,7 +227,7 @@ class LSTMReplayBuffer:
             
         elif strategy == "recency_biased":
             # Recency-biased sampling: favor more recent episodes
-            weights = np.zeros(batch_size, dtype=np.float32)
+            weights = np.ones(batch_size, dtype=np.float32)
             
             # Calculate episode weights based on recency
             if self.use_prioritized:
@@ -268,7 +275,9 @@ class LSTMReplayBuffer:
                     batch[k].append(np.array(episode[k][start:end]))
         
         else:  # "uniform" sampling
-            # Standard uniform sampling
+            # Standard uniform sampling - initialize uniform weights
+            weights = np.ones(batch_size, dtype=np.float32)
+            
             for i in range(batch_size):
                 if self.use_prioritized:
                     # For prioritized buffer, sample randomly from all episodes
@@ -327,18 +336,26 @@ class LSTMReplayBuffer:
                     
                     batch[k].append(sequence)
             
-        # Stack and convert to torch tensors
+        # Stack and convert to torch tensors with proper normalization
         for k in batch:
             if len(batch[k]) > 0:  # Safety check
-                batch[k] = torch.from_numpy(np.stack(batch[k])).float()
-        
+                stacked = np.stack(batch[k])
+                if k == "frames":
+                    # Normalize images to [-1, 1] range
+                    stacked = (stacked.astype(np.float32) - 128.0) / 128.0
+                batch[k] = torch.from_numpy(stacked)
+
         # Cast actions to long
         if "actions" in batch:
             batch["actions"] = batch["actions"].long()
-        
+
         # Cast terminals to float for loss computation
         if "terminals" in batch:
             batch["terminals"] = batch["terminals"].float()
+        
+        # Ensure frames are float32
+        if "frames" in batch:
+            batch["frames"] = batch["frames"].float()
         
         # Add weights for importance sampling
         if weights is not None:
@@ -383,3 +400,72 @@ class LSTMReplayBuffer:
     def is_empty(self):
         """Check if buffer is empty."""
         return len(self) == 0
+
+    def _validate_episode_data(self, episode_data: Dict[str, List[Any]]):
+        """Validate episode data for consistency and proper shapes."""
+        if not episode_data:
+            raise ValueError("Episode data cannot be empty")
+
+        # Check required keys
+        required_keys = ['frames', 'state_float', 'actions', 'rewards', 'terminals']
+        for key in required_keys:
+            if key not in episode_data:
+                raise ValueError(f"Missing required key: {key}")
+
+        # Ensure all lists have the same length
+        episode_length = len(episode_data['frames'])
+        if episode_length == 0:
+            raise ValueError("Episode cannot be empty")
+
+        for key, data in episode_data.items():
+            if len(data) != episode_length:
+                raise ValueError(
+                    f"Episode data length mismatch: {key} has {len(data)} items, expected {episode_length}")
+
+        # Validate frame shapes
+        frames = episode_data['frames']
+        if len(frames) > 0:
+            first_frame = frames[0]
+            if hasattr(first_frame, 'shape'):
+                expected_shape = first_frame.shape
+                for i, frame in enumerate(frames):
+                    if hasattr(frame, 'shape') and frame.shape != expected_shape:
+                        raise ValueError(f"Frame {i} shape mismatch: {frame.shape} vs expected {expected_shape}")
+
+        # Validate state_float dimensions
+        state_float = episode_data['state_float']
+        if len(state_float) > 0:
+            first_state = state_float[0]
+            if hasattr(first_state, 'shape'):
+                expected_dim = first_state.shape
+                for i, state in enumerate(state_float):
+                    if hasattr(state, 'shape') and state.shape != expected_dim:
+                        raise ValueError(f"State {i} shape mismatch: {state.shape} vs expected {expected_dim}")
+
+    def _validate_tensor_shapes(self, batch: Dict[str, torch.Tensor]):
+        """Validate tensor shapes in a batch before returning."""
+        if "frames" in batch:
+            frames = batch["frames"]
+            if frames.dim() != 5:  # (batch, seq_len, channels, height, width)
+                raise ValueError(f"Frames tensor should be 5D, got {frames.dim()}D with shape {frames.shape}")
+
+        if "state_float" in batch:
+            state_float = batch["state_float"]
+            if state_float.dim() != 3:  # (batch, seq_len, features)
+                raise ValueError(
+                    f"State float tensor should be 3D, got {state_float.dim()}D with shape {state_float.shape}")
+
+        if "actions" in batch:
+            actions = batch["actions"]
+            if actions.dim() != 2:  # (batch, seq_len)
+                raise ValueError(f"Actions tensor should be 2D, got {actions.dim()}D with shape {actions.shape}")
+
+        if "rewards" in batch:
+            rewards = batch["rewards"]
+            if rewards.dim() != 2:  # (batch, seq_len)
+                raise ValueError(f"Rewards tensor should be 2D, got {rewards.dim()}D with shape {rewards.shape}")
+
+        if "terminals" in batch:
+            terminals = batch["terminals"]
+            if terminals.dim() != 2:  # (batch, seq_len)
+                raise ValueError(f"Terminals tensor should be 2D, got {terminals.dim()}D with shape {terminals.shape}")
