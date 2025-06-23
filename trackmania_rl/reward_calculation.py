@@ -53,6 +53,7 @@ def calculate_frame_rewards(
     engineered_neoslide_reward,
     engineered_kamikaze_reward,
     engineered_close_to_vcp_reward,
+    wall_collision_penalty=0.0,
 ):
     """
     Calculate per-frame rewards for each step in a rollout.
@@ -63,6 +64,7 @@ def calculate_frame_rewards(
         engineered_neoslide_reward: Reward coefficient for neoslides
         engineered_kamikaze_reward: Reward coefficient for kamikaze moves
         engineered_close_to_vcp_reward: Reward coefficient for checkpoint proximity
+        wall_collision_penalty: Negative reward for hitting walls
 
     Returns:
         Array of rewards for each frame in the rollout
@@ -122,6 +124,11 @@ def calculate_frame_rewards(
                     min(config_copy.engineered_reward_max_dist_to_cur_vcp,
                         np.linalg.norm(rollout_results["state_float"][i][CURRENT_VCP_START_IDX:CURRENT_VCP_END_IDX])),
                 )
+
+            # Wall collision penalty
+            if wall_collision_penalty != 0.0 and "has_lateral_contact" in rollout_results:
+                if rollout_results["has_lateral_contact"][i]:
+                    reward_into[i] += wall_collision_penalty  # This should be negative
 
     return reward_into
 

@@ -23,6 +23,8 @@ class LSTMInferer:
         self.network = network
         self.n_actions = n_actions
         self.epsilon = 0.1
+        self.epsilon_boltzmann = 0.0
+        self.tau_epsilon_boltzmann = 0.01
         self.is_explo = True
         
         # LSTM hidden state management
@@ -111,15 +113,11 @@ class LSTMInferer:
         return img_tensor, float_tensor
 
     def get_exploration_action(self, img, float_inputs):
-        """Get action using epsilon-greedy policy with LSTM"""
+        """Get action using epsilon-greedy and Boltzmann exploration with LSTM"""
         # Update history with new observation
         self.update_history(img, float_inputs)
         
-        # Random action for exploration
-        if np.random.rand() < self.epsilon and self.is_explo:
-            return np.random.randint(self.n_actions), False, 0.0, np.zeros(self.n_actions, dtype=np.float32)
-
-        # Greedy action using LSTM network
+        # Get Q-values from LSTM network
         with torch.no_grad():
             img_seq, float_seq = self.get_sequence_tensors()
             
@@ -130,10 +128,32 @@ class LSTMInferer:
             self.hidden_state = self._detach_hidden_state(new_hidden)
             
             # Get Q-values for the last timestep (most recent observation)
-            last_q_values = q_values[0, -1, :]  # (n_actions,)
-            action = int(torch.argmax(last_q_values).item())
-            
-            return action, True, float(last_q_values[action].item()), last_q_values.cpu().numpy()
+            last_q_values = q_values[0, -1, :].cpu().numpy()  # (n_actions,)
+        
+        # Exploration strategy selection
+        r = np.random.random()
+        
+        if self.is_explo and r < self.epsilon:
+            # Pure random action (epsilon-greedy)
+            get_argmax_on = np.random.randn(*last_q_values.shape)
+            action_chosen_idx = 0  # Random exploration
+        elif self.is_explo and r < self.epsilon + self.epsilon_boltzmann:
+            # Boltzmann exploration: add noise to Q-values
+            get_argmax_on = last_q_values + self.tau_epsilon_boltzmann * np.random.randn(*last_q_values.shape)
+            action_chosen_idx = 1  # Boltzmann exploration
+        else:
+            # Greedy action
+            get_argmax_on = last_q_values
+            action_chosen_idx = 2  # Greedy
+        
+        # Select action based on modified Q-values
+        action = int(np.argmax(get_argmax_on))
+        
+        # Return action info
+        is_greedy = (action_chosen_idx == 2)
+        q_value = float(last_q_values[action])
+        
+        return action, is_greedy, q_value, last_q_values
 
 
 def collector_process_fn(
@@ -226,6 +246,8 @@ def collector_process_fn(
 
         # Update exploration parameters
         inferer.epsilon = utilities.from_exponential_schedule(config_copy.epsilon_schedule, shared_steps.value)
+        inferer.epsilon_boltzmann = utilities.from_exponential_schedule(config_copy.epsilon_boltzmann_schedule, shared_steps.value)
+        inferer.tau_epsilon_boltzmann = config_copy.tau_epsilon_boltzmann
         inferer.is_explo = is_explo
 
         # Set network mode (train for exploration, eval for evaluation)

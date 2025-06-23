@@ -372,9 +372,13 @@ def optimized_process_rollout_lstm(rollout_results, buffer, gamma, accumulated_s
             'engineered_close_to_vcp_reward': utilities.from_linear_schedule(
                 config_copy.engineered_close_to_vcp_reward_schedule, current_step
             ),
+            'wall_collision_penalty' : utilities.from_exponential_schedule(
+            config_copy.wall_collision_penalty_schedule,current_step
+            ),
         }
         optimized_process_rollout_lstm._last_update_step = current_step
-    
+
+
     # Calculate rewards using cached parameters
     from trackmania_rl.reward_calculation import calculate_frame_rewards
     frame_rewards = calculate_frame_rewards(
@@ -383,6 +387,7 @@ def optimized_process_rollout_lstm(rollout_results, buffer, gamma, accumulated_s
         optimized_process_rollout_lstm._cached_params['engineered_neoslide_reward'],
         optimized_process_rollout_lstm._cached_params['engineered_kamikaze_reward'],
         optimized_process_rollout_lstm._cached_params['engineered_close_to_vcp_reward'],
+        optimized_process_rollout_lstm._cached_params['wall_collision_penalty'],
     )
     
     # Vectorized terminal flag creation
@@ -392,22 +397,50 @@ def optimized_process_rollout_lstm(rollout_results, buffer, gamma, accumulated_s
         terminals[-1] = True
     
     # Pre-process data for better memory layout
-    episode_data = {
-        "frames": np.array(rollout_results["frames"], dtype=np.uint8),
-        "state_float": np.array(rollout_results["state_float"], dtype=np.float32),
-        "actions": np.array(rollout_results["actions"], dtype=np.int64),
-        "rewards": np.array(frame_rewards, dtype=np.float32),
-        "terminals": terminals,
-    }
+    # Handle NaN values in actions (which occur when race finishes successfully)
+    actions_raw = rollout_results["actions"]
     
-    # Add episode to buffer
-    buffer.add_episode(episode_data)
+    # Filter out NaN values from actions and corresponding data
+    valid_indices = []
+    valid_actions = []
+    
+    for i, action in enumerate(actions_raw):
+        if not (isinstance(action, float) and np.isnan(action)):
+            valid_indices.append(i)
+            valid_actions.append(int(action))
+    
+    # If we have valid actions, process them
+    if valid_actions:
+        # Filter other arrays to match valid actions
+        valid_frames = [rollout_results["frames"][i] for i in valid_indices]
+        valid_state_float = [rollout_results["state_float"][i] for i in valid_indices]
+        valid_rewards = [frame_rewards[i] for i in valid_indices]
+        valid_terminals = terminals[valid_indices] if len(valid_indices) < len(terminals) else terminals[:len(valid_indices)]
+        
+        episode_data = {
+            "frames": valid_frames,
+            "state_float": np.array(valid_state_float, dtype=np.float32),
+            "actions": np.array(valid_actions, dtype=np.int64),
+            "rewards": np.array(valid_rewards, dtype=np.float32),
+            "terminals": valid_terminals,
+        }
+    else:
+        # If no valid actions, create empty episode data
+        print("Warning: No valid actions found in rollout, skipping episode")
+        episode_data = None
+    
+    # Add episode to buffer only if we have valid data
+    if episode_data is not None:
+        buffer.add_episode(episode_data)
+        episode_length = len(episode_data["frames"])
+    else:
+        episode_length = 0
     
     # Update accumulated stats
-    episode_length = len(rollout_results["frames"])
-    accumulated_stats["cumul_number_memories_generated"] += episode_length
+    total_frames = len(rollout_results["frames"])
+    accumulated_stats["cumul_number_memories_generated"] += total_frames
     accumulated_stats["cumul_number_single_memories_should_have_been_used"] += (
-        config_copy.number_times_single_memory_is_used_before_discard * episode_length
+        config_copy.number_times_single_memory_is_used_before_discard * total_frames
     )
     
     return buffer, episode_length
@@ -501,6 +534,7 @@ def learner_process_fn(
     print(f"Mixed precision: {trainer.use_mixed_precision}")
     print(f"Sequence masking: {trainer.use_sequence_masking}")
     print(f"Temporal weighting: {trainer.use_temporal_weighting}")
+    print(f"Boltzmann exploration enabled: epsilon={config_values['epsilon']:.4f}, epsilon_boltzmann={config_values['epsilon_boltzmann']:.4f}, tau={config_values['tau_epsilon_boltzmann']:.4f}")
 
     step = accumulated_stats.get("training_step", 0)
     print(f"Starting optimized LSTM training from step {step}")
@@ -690,7 +724,10 @@ def learner_process_fn(
             training_params = {
                 "gamma": config_values["gamma"],
                 "learning_rate": config_values["learning_rate"],
-                "weight_decay": config_values["weight_decay"]
+                "weight_decay": config_values["weight_decay"],
+                "epsilon": config_values["epsilon"],
+                "epsilon_boltzmann": config_values["epsilon_boltzmann"],
+                "tau_epsilon_boltzmann": config_values["tau_epsilon_boltzmann"]
             }
 
             step_stats = collect_periodic_stats(
@@ -745,12 +782,19 @@ def update_config_parameters(accumulated_stats):
     tensorboard_suffix = utilities.from_staircase_schedule(
         config_copy.tensorboard_suffix_schedule, current_step
     )
+    
+    # Add Boltzmann exploration parameters
+    epsilon = utilities.from_exponential_schedule(config_copy.epsilon_schedule, current_step)
+    epsilon_boltzmann = utilities.from_exponential_schedule(config_copy.epsilon_boltzmann_schedule, current_step)
 
     return {
         "learning_rate": learning_rate,
         "weight_decay": weight_decay,
         "gamma": gamma,
         "tensorboard_suffix": tensorboard_suffix,
+        "epsilon": epsilon,
+        "epsilon_boltzmann": epsilon_boltzmann,
+        "tau_epsilon_boltzmann": config_copy.tau_epsilon_boltzmann,
     }
 
 

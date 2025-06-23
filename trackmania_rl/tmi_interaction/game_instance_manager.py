@@ -312,6 +312,7 @@ class GameInstanceManager:
             "car_gear_and_wheels": [],
             "q_values": [],
             "meters_advanced_along_centerline": [],
+            "has_lateral_contact": [],
             "state_float": [],
             "furthest_zone_idx": 0,
         }
@@ -723,6 +724,8 @@ class GameInstanceManager:
                         rollout_results["car_gear_and_wheels"].append(sim_state_car_gear_and_wheels)
                         rollout_results["q_values"].append(q_values)
                         rollout_results["state_float"].append(floats)
+                        rollout_results["has_lateral_contact"].append(
+                            last_known_simulation_state.scene_mobil.has_any_lateral_contact)
 
                         compute_action_asap = False
                         n_th_action_we_compute += 1

@@ -24,7 +24,7 @@ lstm_mlp_hidden_dims = (512, 256)  # Two-layer MLP
 lstm_activation = "gelu"
 
 # Dropout rate - moderate dropout for regularization
-lstm_dropout = 0.1
+lstm_dropout = 0.01
 
 gamma = 0.995
 
@@ -46,7 +46,7 @@ optimizer = "AdamW"
 weight_decay = 0.01
 
 # Learning rate schedule parameters
-initial_learning_rate = 5e-5
+initial_learning_rate = 1e-4
 lr_warmup_steps = 1000
 lr_decay_factor = 0.95
 

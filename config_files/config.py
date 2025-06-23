@@ -28,7 +28,7 @@ from config_files.user_config import *
 W_downsized = 160
 H_downsized = 120
 
-run_name = "lstm_test_003"
+run_name = "lstm_test_006"
 running_speed = 80
 
 agent_type = "lstm"  # "mlp", "iqn", "lstm"
@@ -80,18 +80,27 @@ discard_non_greedy_actions_in_nsteps = True
 buffer_test_ratio = 0.05
 
 engineered_speedslide_reward_schedule = [
-    (0, 0),  # Start with no reward for neoslide
-    (1_000_000 * global_schedule_speed, 0.02),  # Introduce small reward after 1M steps
-    (3_000_000 * global_schedule_speed, 0.04),  # Slightly increased reward
-    (5_000_000 * global_schedule_speed, 0.08),  # Moderate reward
-    (7_000_000 * global_schedule_speed, 0.12),  # Higher reward for advanced training
+    (0, 0.005),  # Start with no reward for neoslide
+    (1_000_000 * global_schedule_speed, 0.009),  # Introduce small reward after 1M steps
+    (3_000_000 * global_schedule_speed, 0.009),  # Slightly increased reward
+    (5_000_000 * global_schedule_speed, 0.009),  # Moderate reward
+    (7_000_000 * global_schedule_speed, 0.009),  # Higher reward for advanced training
 ]
 engineered_neoslide_reward_schedule = [
-    (0, 0),  # Start with no reward for neoslide
-    (1_000_000 * global_schedule_speed, 0.02),  # Introduce small reward after 1M steps
-    (3_000_000 * global_schedule_speed, 0.04),   # Slightly increased reward
-    (5_000_000 * global_schedule_speed, 0.08),   # Moderate reward
-    (7_000_000 * global_schedule_speed, 0.12),   # Higher reward for advanced training
+    (0, 0.005),  # Start with no reward for neoslide
+    (1_000_000 * global_schedule_speed, 0.009),  # Introduce small reward after 1M steps
+    (3_000_000 * global_schedule_speed, 0.009),   # Slightly increased reward
+    (5_000_000 * global_schedule_speed, 0.009),   # Moderate reward
+    (7_000_000 * global_schedule_speed, 0.009),   # Higher reward for advanced training
+]
+
+# Wall collision penalty schedule (negative values for punishment)
+wall_collision_penalty_schedule = [
+    (0, -0.012),                    # Start with no penalty
+    (500_000, -0.012),            # Small penalty after 500k steps
+    (1_000_000, -0.012),          # Moderate penalty after 1M steps
+    (2_000_000, -0.012),          # Higher penalty after 2M steps
+    (5_000_000, -0.012),          # Strong penalty for advanced training
 ]
 
 engineered_kamikaze_reward_schedule = [
@@ -102,8 +111,8 @@ engineered_close_to_vcp_reward_schedule = [
 ]
 
 n_steps = 3
-constant_reward_per_ms = -10 / 5000
-reward_per_m_advanced_along_centerline = 5 / 500
+constant_reward_per_ms = -35 / 5000
+reward_per_m_advanced_along_centerline = 21 / 500
 
 number_times_single_memory_is_used_before_discard = 32  # 32 // 4
 
@@ -269,8 +278,8 @@ map_cycle = []
 
 
 map_cycle += [
-    repeat(("map5", '"My Challenges/Map5.Challenge.Gbx"', "map5_0.5m_cl.npy", True, True), 4),
-    repeat(("map5", '"My Challenges/Map5.Challenge.Gbx"', "map5_0.5m_cl.npy", False, True), 1),
+    # repeat(("map5", '"My Challenges/Map5.Challenge.Gbx"', "map5_0.5m_cl.npy", True, True), 4),
+    # repeat(("map5", '"My Challenges/Map5.Challenge.Gbx"', "map5_0.5m_cl.npy", False, True), 1),
     # repeat(("map8", '"My Challenges/Map8.Challenge.Gbx"', "map8_0.5m_cl.npy", True, True), 4),
     # repeat(("map8", '"My Challenges/Map8.Challenge.Gbx"', "map8_0.5m_cl.npy", False, True), 1),
     # repeat(("yosh1", '"My Challenges\Yosh1.Challenge.Gbx"', "yosh1_0.5m_clprog.npy", True, True), 4),
@@ -293,8 +302,8 @@ map_cycle += [
     # repeat(("B05", '"Official Maps\Green\B05-Race.Challenge.Gbx"', "B05-Race_10m_cl.npy", False, True), 1),
     # repeat(("hock", "ESL-Hockolicious.Challenge.Gbx", "ESL-Hockolicious_0.5m_cl2.npy", True, True), 4),
     # repeat(("hock", "ESL-Hockolicious.Challenge.Gbx", "ESL-Hockolicious_0.5m_cl2.npy", False, True), 1),
-    # repeat(("A14-Race", '"A14-Race.Challenge.Gbx"', "A14-Race_0.5m_berkmocann.npy", True, True), 4),
-    # repeat(("A14-Race", '"A14-Race.Challenge.Gbx"', "A14-Race_0.5m_berkmocann.npy", False, True), 1),
+    repeat(("A14-Race", '"A14-Race.Challenge.Gbx"', "A14-Race_0.5m_berkmocann.npy", True, True), 4),
+    repeat(("A14-Race", '"A14-Race.Challenge.Gbx"', "A14-Race_0.5m_berkmocann.npy", False, True), 1),
     # repeat(("A02", f'"Official Maps\A02-Race.Challenge.Gbx"', "A02-Race_0.5m_cl2.npy", False, False), 1),
     # repeat(("yellowmile", f'"The Yellow Mile_.Challenge.Gbx"', "YellowMile_0.5m_cl.npy", False, False), 1),
     # repeat(("te86", f'"te 86.Challenge.Gbx"', "te86_0.5m_cl.npy", False, False), 1),
